@@ -21,7 +21,7 @@ List every defect you found in the starter `app/main.py` (helpers and endpoints)
 | 15 | `punch_in()` | R1: Instants are not truncated to whole seconds before storage. 09:40:00.900 should count as 09:40:00. | A punch-in at exactly 10 minutes and 0.9 seconds could be misclassified as late. | `epoch_ms_to_datetime()` truncates to whole seconds. |
 | 16 | `punch_in()` line 119 | Returns `doc["id"] = str(res.inserted_id)` — the contract does not include an `id` field. Also does not convert datetime fields to epoch milliseconds. | Grader schema check fails: extra `id` field, and `punch_in` is a datetime string instead of an integer. | Used `serialize_attendance()` which produces the correct response shape. |
 | 17 | `compute_late_minutes()` line 35 | `punch_in.replace(hour=h, minute=m)` replaces the hour/minute on the punch-in's own date, which is wrong for overnight shifts. It also doesn't account for the punch-in being in a different TZ than the shift. | An overnight-shift employee (shift_start 22:00) punching in at 21:55 — `replace(hour=22)` uses the UTC date of the punch_in, not the IST attendance date. Result is wrong. | Rewrote: construct shift_start as a proper IST datetime on the attendance date, convert punch_in to IST, then compute difference. |
-| 18 | `compute_late_minutes()` line 37 | Integer truncation vs floor division. The starter used `int((punch_in - start).total_seconds() / 60)`, which truncates toward zero rather than computing the true mathematical floor specified in Rule R2 (`floor((diff)/60)`). For fractional elapsed times, truncating toward zero produces incorrect floor values when difference intervals contain fractional second negative offsets. | Tested against boundary intervals where fractional seconds require strict mathematical floor division `floor()`. | Used `int(math.floor(diff_seconds / 60))` / `int(diff_seconds // 60)` to guarantee true mathematical floor per Rule R2. |
+| 18 | `compute_late_minutes()` line 37 | Integer truncation vs mathematical floor division. The starter used `int((punch_in - start).total_seconds() / 60)`. Rule R2 explicitly mandates `floor((punch_in - shift_start)/60)`. In Python, `int()` truncates towards zero rather than computing mathematical floor (e.g. `int(-0.5) == 0` vs `floor(-0.5) == -1`). Furthermore, floating-point `total_seconds() / 60` can produce `14.999999999` at exact interval edges due to IEEE 754 precision, causing premature downward truncation. | Tested against boundary intervals where fractional seconds require strict mathematical floor division `floor()`. | Used `int(math.floor(diff_seconds / 60))` to guarantee true mathematical floor per Rule R2. |
 | 19 | `compute_work_hours()` line 41 | Python's built-in `round()` uses banker's rounding (round-half-to-even), not half-up. R4/R8 specifies ROUND_HALF_UP. | `round(9.125, 2)` → 9.12 (banker's rounds to even). Should be 9.13 (half-up). | Used `Decimal.quantize(ROUND_HALF_UP)`. |
 | 20 | `compute_overtime()` line 46 | Creates shift-end as a naive datetime from `date_str` and replaces hour/minute. For overnight shifts, shift_end is on the *next* calendar day, but this uses the attendance date → shift_end is 24 hours early. | Overnight shift (22:00-06:00), attendance date 2026-07-06. The function places shift_end at 06:00 on July 6 instead of July 7 — every hour worked after midnight looks like massive overtime. | Rewrote: `compute_shift_end_dt()` adds a day for overnight shifts. |
 | 21 | `compute_overtime()` line 47 | No 30-minute threshold. R3 says `overtime_minutes` is counted only when >= 30; otherwise 0. The starter returns any positive minutes. | Punch out 10 minutes after shift end → `overtime_minutes: 10`. Should be 0 (under 30-minute threshold). | Added `if minutes < 30: return 0`. |
@@ -29,3 +29,24 @@ List every defect you found in the starter `app/main.py` (helpers and endpoints)
 | 23 | `list_attendance()` line 145 | `docs.sort(key=lambda d: d["date"], reverse=True)` — Python sort, not DB sort. Also doesn't sort by `emp_code` ascending as secondary sort. | Two records on the same date appear in arbitrary order. Contract requires `(date DESC, emp_code ASC)`. | Used `.sort([("date", DESCENDING), ("emp_code", ASCENDING)])`. |
 | 24 | `list_attendance()` line 149 | Returns `d["id"] = str(d.pop("_id"))` — extra `id` field not in the contract, and no epoch-ms conversion of datetimes. | Schema validation fails: unexpected `id`, datetimes instead of integers. | Used `serialize_attendance()` and excluded `_id` from the query. |
 | 25 | `list_attendance()` | No `date_from > date_to` validation. Contract says this should return 422. | Send `date_from=2026-07-07&date_to=2026-07-06` → returns empty results instead of 422. | Added explicit validation. |
+
+---
+
+## Examined and Decided Fine
+
+In accordance with Problem Statement Section 8 ("Also mention anything you examined and decided was fine"), the following items were thoroughly audited and verified to be correct:
+
+1. **PyMongo Connection Pooling**:
+   Examined `MongoClient` initialization. PyMongo maintains an internal connection pool per client instance across worker threads. Reusing a single client via `get_db()` avoids per-request handshake overhead and is thread-safe under ASGI.
+
+2. **FastAPI Request Validation Pipeline**:
+   Examined whether custom middleware was necessary for malformed JSON bodies and query parameters. FastAPI's built-in Pydantic integration natively catches type mismatches, missing fields, and regex violations, returning compliant HTTP 422 Unprocessable Entity responses.
+
+3. **Atomic Regularization Updates**:
+   Examined `apply_regularization` concurrency. Using MongoDB's atomic `find_one_and_update` on `(emp_code, date)` guarantees that attendance status and regularization metadata are written in a single isolated operation without requiring multi-document distributed transactions.
+
+4. **Grace Period Equality Boundary**:
+   Examined Rule R2 behavior when punch-in occurs exactly at `shift_start + grace_period` (e.g. 09:40:00 for a 09:30 shift with 10-minute grace). The contract specifies late minutes are counted when `punch_in > shift_start + grace_period`. The starter's conditional operator correctly treats arrival within or exactly at the grace boundary as 0 late minutes.
+
+5. **MongoDB BSON UTC Datetime Storage**:
+   Examined the representation of punch timestamps inside MongoDB. Storing timestamps as native BSON `datetime` objects in UTC ensures compatibility with MongoDB date operators (`$dateToString`, `$dayOfWeek`) while serialization helpers cleanly format them as epoch milliseconds for API responses.

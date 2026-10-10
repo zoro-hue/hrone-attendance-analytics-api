@@ -85,6 +85,11 @@ class TestRoundHalfUp:
     def test_none(self):
         assert round_half_up(None, 2) is None
 
+    def test_decimal_boundary_half_up(self):
+        # Averaging 6.05 and 6.10 produces 6.075 which must round to 6.08 under half-up
+        avg_dec = (Decimal("6.05") + Decimal("6.10")) / Decimal("2")
+        assert round_half_up(avg_dec, 2) == 6.08
+
 
 class TestEpochConversion:
     def test_roundtrip(self):
@@ -485,6 +490,19 @@ class TestListAttendance:
         r = client.get("/attendance", params={"date_from": "2026-07-07", "date_to": "2026-07-06"})
         assert r.status_code == 422
 
+    def test_invalid_calendar_date(self, client):
+        # Reject invalid calendar dates like Feb 31 or month 13
+        r = client.get("/attendance", params={"date_from": "2026-02-31"})
+        assert r.status_code == 422
+        r = client.get("/attendance", params={"date_to": "2026-13-01"})
+        assert r.status_code == 422
+        r = client.get("/attendance", params={"date_from": "invalid-format"})
+        assert r.status_code == 422
+
+    def test_invalid_status_filter(self, client):
+        r = client.get("/attendance", params={"status": "INVALID_STATUS"})
+        assert r.status_code == 422
+
 
 @skip_no_mongo
 class TestRegularize:
@@ -598,6 +616,65 @@ class TestDepartmentSummary:
         data = r.json()
         for item in data["items"]:
             assert item["department"] == "Engineering"
+
+    def test_avg_work_hours_half_boundary_rounding(self, client):
+        # Insert 2 employees with work_hours 6.05 and 6.10 to verify Decimal half-up boundary rounding
+        from pymongo import MongoClient
+        mongo = MongoClient(os.getenv("MONGO_URI", "mongodb://localhost:27017"))
+        test_db = mongo[os.getenv("MONGO_DB", "attendance_test_db")]
+        test_db.employees.insert_many([
+            {
+                "emp_code": "EMP8881",
+                "name": "Round Test 1",
+                "email": "rt1@example.com",
+                "department": "PrecisionTest",
+                "shift_start": "09:00",
+                "shift_end": "18:00",
+                "joined_on": "2026-01-01",
+                "created_at": datetime.now(tz=timezone.utc),
+            },
+            {
+                "emp_code": "EMP8882",
+                "name": "Round Test 2",
+                "email": "rt2@example.com",
+                "department": "PrecisionTest",
+                "shift_start": "09:00",
+                "shift_end": "18:00",
+                "joined_on": "2026-01-01",
+                "created_at": datetime.now(tz=timezone.utc),
+            },
+        ])
+        test_db.attendance_logs.insert_many([
+            {
+                "emp_code": "EMP8881",
+                "date": "2026-07-06",
+                "status": "PRESENT",
+                "punch_in": datetime(2026, 7, 6, 3, 30, tzinfo=timezone.utc),
+                "punch_out": datetime(2026, 7, 6, 9, 33, tzinfo=timezone.utc),
+                "work_hours": 6.05,
+                "late_minutes": 0,
+                "overtime_minutes": 0,
+                "half_day": False,
+            },
+            {
+                "emp_code": "EMP8882",
+                "date": "2026-07-06",
+                "status": "PRESENT",
+                "punch_in": datetime(2026, 7, 6, 3, 30, tzinfo=timezone.utc),
+                "punch_out": datetime(2026, 7, 6, 9, 36, tzinfo=timezone.utc),
+                "work_hours": 6.10,
+                "late_minutes": 0,
+                "overtime_minutes": 0,
+                "half_day": False,
+            },
+        ])
+        mongo.close()
+
+        r = client.get("/analytics/departments/summary", params={"month": "2026-07", "department": "PrecisionTest"})
+        assert r.status_code == 200
+        items = r.json()["items"]
+        assert len(items) == 1
+        assert items[0]["avg_work_hours"] == 6.08
 
 
 @skip_no_mongo
@@ -882,6 +959,69 @@ class TestExplainFilteringAndIndexes:
         assert r.status_code == 200
         data = r.json()
         assert "explain" in data
+
+    def test_explain_attendance_list_validates_dates_and_status(self, client):
+        # Invalid calendar date
+        r = client.get("/admin/explain/attendance_list", params={"date_from": "2026-02-31"})
+        assert r.status_code == 422
+        # date_from > date_to
+        r = client.get("/admin/explain/attendance_list", params={"date_from": "2026-07-15", "date_to": "2026-07-10"})
+        assert r.status_code == 422
+        # Invalid status
+        r = client.get("/admin/explain/attendance_list", params={"status": "INVALID"})
+        assert r.status_code == 422
+
+    def test_explain_employee_monthly_pipeline_fidelity(self, client):
+        r = client.get("/admin/explain/employee_monthly", params={
+            "emp_code": "EMP0001",
+            "month": "2026-07",
+        })
+        assert r.status_code == 200
+        data = r.json()
+        assert data["endpoint"] == "employee_monthly"
+        assert "explain" in data
+        exp = data["explain"]
+        assert "executionStats" in exp or ("stages" in exp and "executionStats" in exp["stages"][0].get("$cursor", {}))
+
+    def test_explain_late_leaderboard_pipeline_fidelity(self, client):
+        r = client.get("/admin/explain/late_leaderboard", params={
+            "month": "2026-07",
+            "department": "Engineering",
+            "limit": 5,
+        })
+        assert r.status_code == 200
+        data = r.json()
+        assert data["endpoint"] == "late_leaderboard"
+        assert "explain" in data
+        exp = data["explain"]
+        assert "executionStats" in exp or ("stages" in exp and "executionStats" in exp["stages"][0].get("$cursor", {}))
+
+    def test_explain_department_trend_pipeline_fidelity(self, client):
+        r = client.get("/admin/explain/department_trend", params={
+            "department": "Engineering",
+            "from": "2026-07-01",
+            "to": "2026-07-07",
+        })
+        assert r.status_code == 200
+        data = r.json()
+        assert data["endpoint"] == "department_trend"
+        assert "explain" in data
+        exp = data["explain"]
+        assert "executionStats" in exp or ("stages" in exp and "executionStats" in exp["stages"][0].get("$cursor", {}))
+
+    def test_explain_department_trend_validates_dates(self, client):
+        r = client.get("/admin/explain/department_trend", params={
+            "department": "Engineering",
+            "from": "2026-02-31",
+            "to": "2026-07-07",
+        })
+        assert r.status_code == 422
+        r = client.get("/admin/explain/department_trend", params={
+            "department": "Engineering",
+            "from": "2026-07-10",
+            "to": "2026-07-05",
+        })
+        assert r.status_code == 422
 
 
 @skip_no_mongo

@@ -1,6 +1,6 @@
 # Employee Attendance & Analytics API
 
-A production-ready FastAPI + MongoDB backend service implementing employee attendance tracking, regularization audit trails, and high-performance analytics aggregation pipelines according to the business specifications (R1–R10).
+A FastAPI + MongoDB backend service implementing employee attendance tracking, regularization audit trails, and analytics aggregation pipelines according to the business specifications (R1–R10).
 
 ## Tech Stack
 - **Python 3.11+**
@@ -17,7 +17,8 @@ Ensure MongoDB is running locally on port 27017 (or provide a remote connection 
 
 ```bash
 # Clone and enter directory
-cd candidate_kit
+git clone https://github.com/zoro-hue/hrone-attendance-analytics-api.git
+cd hrone-attendance-analytics-api
 
 # Create virtual environment
 python -m venv .venv
@@ -75,9 +76,9 @@ python -m pytest tests/test_api.py -v
    - Atomic document updates ensure concurrent regularizations do not lose history audit logs.
 
 3. **High-Performance MongoDB Aggregations**:
-   - Pure database-side aggregation pipelines (`$lookup`, `$group`, `$setWindowFields`, `$densify`).
-   - No in-memory Python looping over datasets.
-   - Full index coverage for sub-second execution on 100k+ record sets.
+   - Database-side aggregation pipelines (`$lookup`, `$group`, `$setWindowFields`, `$densify`).
+   - Pure database calculations without in-memory dataset iteration.
+   - Index-backed execution for fast performance on 100k+ record sets.
 
 4. **Query Plan Explainability**:
    - `GET /admin/explain/{endpoint}` executes with `executionStats` to verify that all primary queries utilize index scans (`IXSCAN`).
@@ -86,18 +87,17 @@ python -m pytest tests/test_api.py -v
 
 ## Project Structure
 ```
-candidate_kit/
+hrone-attendance-analytics-api/
 ├── app/
 │   ├── __init__.py
 │   └── main.py          # Complete application implementation in a single cohesive file
 ├── sample_data/         # MongoDB Extended JSON sample records
 ├── tests/
 │   ├── __init__.py
-│   └── test_api.py      # Comprehensive pytest test suite (86 unit, integration, and concurrency regression tests)
+│   └── test_api.py      # Automated pytest suite (95 unit, integration, and concurrency regression tests)
 ├── DATA_MODEL.md        # Document schemas and sample record reference
-├── DECISIONS.md         # Architecture, indexing, and concurrency rationale
+├── DECISIONS.md         # Architecture, indexing, and concurrency rationale (194 words)
 ├── openapi.yaml         # Complete OpenAPI 3.0 contract
-├── PROBLEM_STATEMENT.docx
 ├── README.md            # Setup and operations documentation
 ├── requirements.txt     # Python dependencies
 ├── REVIEW.md            # Code review documenting 25 starter defects and remedies

@@ -29,3 +29,6 @@ dump/
 *.dump
 *.bson
 *.tar.gz
+
+# Confidential candidate brief
+PROBLEM_STATEMENT.docx
