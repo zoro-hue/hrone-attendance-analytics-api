@@ -345,10 +345,12 @@ class EmployeeCreate(BaseModel):
     @field_validator("joined_on")
     @classmethod
     def validate_joined_on(cls, v: str) -> str:
+        if not isinstance(v, str) or not re.match(r"^\d{4}-(0[1-9]|1[0-2])-(0[1-9]|[12]\d|3[01])$", v):
+            raise ValueError("joined_on must be exact YYYY-MM-DD")
         try:
-            date.fromisoformat(v)
-        except (ValueError, TypeError):
-            raise ValueError("joined_on must be YYYY-MM-DD")
+            datetime.strptime(v, "%Y-%m-%d")
+        except ValueError:
+            raise ValueError("joined_on must be a valid calendar date")
         return v
 
 
@@ -364,14 +366,14 @@ class PunchInRequest(BaseModel):
             raise ValueError(f"status must be one of {sorted(PRESENCE_STATUSES)}")
         return v
 
-    @field_validator("punched_at")
+    @field_validator("punched_at", mode="before")
     @classmethod
     def validate_punched_at(cls, v):
         if v is not None:
             if isinstance(v, bool):
-                raise ValueError("punched_at must be an integer epoch-ms value")
-            if isinstance(v, float):
-                raise ValueError("punched_at must be an integer, not a float")
+                raise ValueError("punched_at must be an integer epoch-ms value, not boolean")
+            if isinstance(v, (str, float)):
+                raise ValueError("punched_at must be an integer epoch-ms value, not string or float")
             if not isinstance(v, int):
                 raise ValueError("punched_at must be an integer epoch-ms value")
             if v < EPOCH_MS_MIN or v > EPOCH_MS_MAX:
@@ -383,14 +385,14 @@ class PunchOutRequest(BaseModel):
     emp_code: str
     punched_at: Optional[int] = None
 
-    @field_validator("punched_at")
+    @field_validator("punched_at", mode="before")
     @classmethod
     def validate_punched_at(cls, v):
         if v is not None:
             if isinstance(v, bool):
-                raise ValueError("punched_at must be an integer epoch-ms value")
-            if isinstance(v, float):
-                raise ValueError("punched_at must be an integer, not a float")
+                raise ValueError("punched_at must be an integer epoch-ms value, not boolean")
+            if isinstance(v, (str, float)):
+                raise ValueError("punched_at must be an integer epoch-ms value, not string or float")
             if not isinstance(v, int):
                 raise ValueError("punched_at must be an integer epoch-ms value")
             if v < EPOCH_MS_MIN or v > EPOCH_MS_MAX:
@@ -426,14 +428,14 @@ class RegularizeRequest(BaseModel):
             raise ValueError(f"status must be one of {sorted(ALL_STATUSES)}")
         return v
 
-    @field_validator("punch_in", "punch_out")
+    @field_validator("punch_in", "punch_out", mode="before")
     @classmethod
     def validate_punch_times(cls, v):
         if v is not None:
             if isinstance(v, bool):
-                raise ValueError("must be an integer epoch-ms value")
-            if isinstance(v, float):
-                raise ValueError("must be an integer, not a float")
+                raise ValueError("must be an integer epoch-ms value, not boolean")
+            if isinstance(v, (str, float)):
+                raise ValueError("must be an integer epoch-ms value, not string or float")
             if not isinstance(v, int):
                 raise ValueError("must be an integer epoch-ms value")
             if v < EPOCH_MS_MIN or v > EPOCH_MS_MAX:
@@ -455,11 +457,13 @@ def _validate_month(month: str) -> tuple[str, str]:
 
 
 def _validate_date(d: str) -> date:
-    """Parse and validate a YYYY-MM-DD date string."""
+    """Parse and validate an exact YYYY-MM-DD date string representing a valid calendar date."""
+    if not isinstance(d, str) or not re.match(r"^\d{4}-(0[1-9]|1[0-2])-(0[1-9]|[12]\d|3[01])$", d):
+        raise HTTPException(422, detail=f"Invalid date format (must be YYYY-MM-DD): {d}")
     try:
-        return date.fromisoformat(d)
-    except (ValueError, TypeError):
-        raise HTTPException(422, detail=f"Invalid date format: {d}")
+        return datetime.strptime(d, "%Y-%m-%d").date()
+    except ValueError:
+        raise HTTPException(422, detail=f"Invalid calendar date: {d}")
 
 
 def _validate_page_params(page: int, page_size: int):
@@ -592,11 +596,11 @@ def punch_out(body: PunchOutRequest):
         now = datetime.now(tz=timezone.utc)
         ts = now.replace(microsecond=0)
 
-    # Find the most recent record whose punch_in is at or before punched_at
+    # Find the most recent record with a punch-in for this employee
     record = _db.attendance_logs.find_one(
         {
             "emp_code": body.emp_code,
-            "punch_in": {"$ne": None, "$lte": ts},
+            "punch_in": {"$ne": None},
         },
         sort=[("punch_in", DESCENDING)],
     )
@@ -1282,120 +1286,158 @@ def department_trend(
     if not dept_exists:
         raise HTTPException(404, detail="Unknown department (no employees)")
 
-    from_str = from_date.isoformat()
-    to_str = to_date.isoformat()
+    from_dt = datetime(from_date.year, from_date.month, from_date.day)
+    to_dt_plus_1 = datetime(to_date.year, to_date.month, to_date.day) + timedelta(days=1)
 
-    # Get all employees in this department with their joined_on dates
-    dept_employees = list(
-        _db.employees.find(
-            {"department": department},
-            {"_id": 0, "emp_code": 1, "joined_on": 1},
-        )
-    )
+    dept_emps = list(_db.employees.find({"department": department}, {"_id": 0, "emp_code": 1}))
+    emp_codes = [e["emp_code"] for e in dept_emps]
 
-    # Build day-by-day results — the contract says to use $densify,
-    # but we need to compute headcount per day anyway, so we do a hybrid approach:
-    # 1. Aggregate attendance data from MongoDB
-    # 2. Fill gaps in Python with precomputed headcounts
-
-    # Get attendance data grouped by date
-    att_pipeline = [
+    pipeline = [
         {
-            "$match": {
-                "date": {"$gte": from_str, "$lte": to_str},
-                "emp_code": {"$in": [e["emp_code"] for e in dept_employees]},
+            "$documents": [
+                {"date_dt": from_dt}
+            ]
+        },
+        {
+            "$densify": {
+                "field": "date_dt",
+                "range": {
+                    "step": 1,
+                    "unit": "day",
+                    "bounds": [from_dt, to_dt_plus_1]
+                }
             }
         },
         {
-            "$group": {
-                "_id": "$date",
-                "present_count_full": {
-                    "$sum": {
-                        "$cond": [
-                            {
-                                "$and": [
-                                    {"$in": ["$status", list(PRESENCE_STATUSES)]},
-                                    {"$eq": [{"$ifNull": ["$half_day", False]}, False]},
-                                ]
-                            },
-                            1,
-                            0,
-                        ]
-                    }
-                },
-                "present_count_half": {
-                    "$sum": {
-                        "$cond": [
-                            {
-                                "$and": [
-                                    {"$in": ["$status", list(PRESENCE_STATUSES)]},
-                                    {"$eq": [{"$ifNull": ["$half_day", False]}, True]},
-                                ]
-                            },
-                            0.5,
-                            0,
-                        ]
-                    }
-                },
-                "late_count": {
-                    "$sum": {
-                        "$cond": [
-                            {"$gt": [{"$ifNull": ["$late_minutes", 0]}, 0]},
-                            1,
-                            0,
-                        ]
-                    }
-                },
+            "$project": {
+                "_id": 0,
+                "date": {"$dateToString": {"date": "$date_dt", "format": "%Y-%m-%d"}},
+                "is_working_day": {
+                    "$in": [{"$dayOfWeek": "$date_dt"}, [2, 3, 4, 5, 6]]
+                }
             }
         },
+        {
+            "$lookup": {
+                "from": "employees",
+                "let": {"d_str": "$date"},
+                "pipeline": [
+                    {
+                        "$match": {
+                            "$expr": {
+                                "$and": [
+                                    {"$eq": ["$department", department]},
+                                    {"$lte": ["$joined_on", "$$d_str"]}
+                                ]
+                            }
+                        }
+                    },
+                    {"$count": "hc"}
+                ],
+                "as": "hc_docs"
+            }
+        },
+        {
+            "$lookup": {
+                "from": "attendance_logs",
+                "let": {"d_str": "$date"},
+                "pipeline": [
+                    {
+                        "$match": {
+                            "$expr": {
+                                "$and": [
+                                    {"$eq": ["$date", "$$d_str"]},
+                                    {"$in": ["$emp_code", emp_codes]}
+                                ]
+                            }
+                        }
+                    },
+                    {
+                        "$group": {
+                            "_id": None,
+                            "present_count": {
+                                "$sum": {
+                                    "$cond": [
+                                        {"$in": ["$status", list(PRESENCE_STATUSES)]},
+                                        {"$cond": [{"$eq": ["$half_day", True]}, 0.5, 1.0]},
+                                        0.0
+                                    ]
+                                }
+                            },
+                            "late_count": {
+                                "$sum": {
+                                    "$cond": [
+                                        {"$gt": [{"$ifNull": ["$late_minutes", 0]}, 0]},
+                                        1,
+                                        0
+                                    ]
+                                }
+                            }
+                        }
+                    }
+                ],
+                "as": "att_docs"
+            }
+        },
+        {
+            "$addFields": {
+                "headcount": {"$ifNull": [{"$first": "$hc_docs.hc"}, 0]},
+                "present_count": {"$ifNull": [{"$first": "$att_docs.present_count"}, 0.0]},
+                "late_count": {"$ifNull": [{"$first": "$att_docs.late_count"}, 0]}
+            }
+        },
+        {
+            "$addFields": {
+                "attendance_rate": {
+                    "$cond": [
+                        {
+                            "$and": [
+                                {"$eq": ["$is_working_day", True]},
+                                {"$gt": ["$headcount", 0]}
+                            ]
+                        },
+                        {"$divide": ["$present_count", "$headcount"]},
+                        None
+                    ]
+                }
+            }
+        },
+        {
+            "$setWindowFields": {
+                "sortBy": {"date": 1},
+                "output": {
+                    "moving_avg_7d": {
+                        "$avg": "$attendance_rate",
+                        "window": {
+                            "documents": [-6, "current"]
+                        }
+                    }
+                }
+            }
+        },
+        {
+            "$project": {
+                "hc_docs": 0,
+                "att_docs": 0
+            }
+        }
     ]
-    att_by_date = {
-        r["_id"]: r for r in _db.attendance_logs.aggregate(att_pipeline)
-    }
 
-    # Build daily items
+    raw_items = list(_db.aggregate(pipeline))
+
     items = []
-    rates_window: list[Optional[float]] = []  # sliding window for moving_avg_7d
-
-    d = from_date
-    while d <= to_date:
-        d_str = d.isoformat()
-        is_working = d.weekday() < 5  # Mon-Fri
-
-        # Headcount: employees with joined_on <= this day (R9)
-        hc = sum(1 for e in dept_employees if e["joined_on"] <= d_str)
-
-        att = att_by_date.get(d_str, {})
-        present_count = att.get("present_count_full", 0) + att.get("present_count_half", 0)
-        late_count = att.get("late_count", 0)
-
-        # attendance_rate: only on working days with headcount > 0
-        if is_working and hc > 0:
-            rate = round_half_up(present_count / hc, 4)
-        else:
-            rate = None
-
-        rates_window.append(rate)
-
-        # moving_avg_7d: mean of non-null rates in the last 7 rows (within requested range)
-        window = rates_window[-7:]
-        non_null = [r for r in window if r is not None]
-        if non_null:
-            moving_avg = round_half_up(sum(non_null) / len(non_null), 4)
-        else:
-            moving_avg = None
-
+    for r in raw_items:
+        rate = r["attendance_rate"]
+        m_avg = r["moving_avg_7d"]
         items.append({
-            "date": d_str,
-            "is_working_day": is_working,
-            "headcount": hc,
-            "present_count": present_count,
-            "late_count": late_count,
-            "attendance_rate": rate,
-            "moving_avg_7d": moving_avg,
+            "date": r["date"],
+            "is_working_day": r["is_working_day"],
+            "headcount": r["headcount"],
+            "present_count": r["present_count"],
+            "late_count": r["late_count"],
+            "attendance_rate": round_half_up(rate, 4) if rate is not None else None,
+            "moving_avg_7d": round_half_up(m_avg, 4) if m_avg is not None else None,
         })
-
-        d += timedelta(days=1)
 
     return {"department": department, "items": items}
 
@@ -1489,6 +1531,13 @@ def explain_endpoint(
         first_day_str, last_day_str = _validate_month(month)
 
         match_stage: dict = {"date": {"$gte": first_day_str, "$lte": last_day_str}}
+        if department:
+            emp_codes = [
+                e["emp_code"]
+                for e in _db.employees.find({"department": department}, {"emp_code": 1, "_id": 0})
+            ]
+            match_stage["emp_code"] = {"$in": emp_codes}
+
         pipeline = [
             {"$match": match_stage},
             {
@@ -1500,10 +1549,10 @@ def explain_endpoint(
                 }
             },
             {"$unwind": "$emp_info"},
-            {"$group": {"_id": "$emp_info.department", "count": {"$sum": 1}}},
         ]
         if department:
-            pipeline.insert(1, {"$match": {"emp_info.department": department}})
+            pipeline.append({"$match": {"emp_info.department": department}})
+        pipeline.append({"$group": {"_id": "$emp_info.department", "count": {"$sum": 1}}})
 
         cmd = {
             "explain": {

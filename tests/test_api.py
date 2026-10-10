@@ -8,6 +8,7 @@ If MongoDB is unavailable, tests that require it will be skipped.
 import os
 import time
 import math
+import concurrent.futures
 import pytest
 from datetime import datetime, timezone, timedelta, date
 from unittest.mock import patch
@@ -456,7 +457,7 @@ class TestPunchOut:
             "emp_code": "EMP0004",
             "punched_at": ts_out,
         })
-        assert r.status_code == 404  # no punch_in at or before this time
+        assert r.status_code == 422  # punch_out timestamp <= punch_in is 422 per OpenAPI specification
 
 
 @skip_no_mongo
@@ -706,6 +707,206 @@ class TestExplainEndpoint:
     def test_invalid_endpoint(self, client):
         r = client.get("/admin/explain/invalid_endpoint")
         assert r.status_code == 422
+
+
+@skip_no_mongo
+class TestStrictInputValidation:
+    def test_punch_in_rejects_string_timestamp(self, client):
+        r = client.post("/attendance/punch-in", json={
+            "emp_code": "EMP0001",
+            "punched_at": "1786335300000",
+        })
+        assert r.status_code == 422
+
+    def test_punch_in_rejects_float_timestamp(self, client):
+        r = client.post("/attendance/punch-in", json={
+            "emp_code": "EMP0001",
+            "punched_at": 1786335300000.5,
+        })
+        assert r.status_code == 422
+
+    def test_punch_in_rejects_boolean_timestamp(self, client):
+        r = client.post("/attendance/punch-in", json={
+            "emp_code": "EMP0001",
+            "punched_at": True,
+        })
+        assert r.status_code == 422
+
+    def test_punch_in_rejects_seconds_timestamp(self, client):
+        r = client.post("/attendance/punch-in", json={
+            "emp_code": "EMP0001",
+            "punched_at": 1786335300,
+        })
+        assert r.status_code == 422
+
+    def test_punch_out_rejects_non_integer_timestamp(self, client):
+        for bad_val in ["1786335300000", 1786335300000.5, True, 1786335300]:
+            r = client.post("/attendance/punch-out", json={
+                "emp_code": "EMP0001",
+                "punched_at": bad_val,
+            })
+            assert r.status_code == 422
+
+    def test_regularize_rejects_non_integer_timestamp(self, client):
+        r = client.patch("/attendance/EMP0001/2026-07-06", json={
+            "punch_in": "1786335300000",
+            "reason": "Test regularize validation",
+            "regularized_by": "HR_ADMIN",
+        })
+        assert r.status_code == 422
+
+    def test_employee_joined_on_rejects_invalid_calendar_date(self, client):
+        r = client.post("/employees", json={
+            "emp_code": "EMP8888",
+            "name": "Invalid Date",
+            "email": "inv@example.com",
+            "department": "Engineering",
+            "joined_on": "2026-02-31",
+        })
+        assert r.status_code == 422
+
+    def test_employee_joined_on_rejects_malformed_pattern(self, client):
+        for bad_date in ["2026-2-5", "2026/02/05", "05-02-2026", "2026-02-05T00:00:00"]:
+            r = client.post("/employees", json={
+                "emp_code": "EMP8889",
+                "name": "Bad Format",
+                "email": "bad@example.com",
+                "department": "Engineering",
+                "joined_on": bad_date,
+            })
+            assert r.status_code == 422
+
+    def test_trend_rejects_invalid_calendar_date(self, client):
+        r = client.get("/analytics/departments/Engineering/trend", params={
+            "from": "2026-02-29",
+            "to": "2026-03-05",
+        })
+        assert r.status_code == 422
+
+    def test_trend_rejects_malformed_date(self, client):
+        r = client.get("/analytics/departments/Engineering/trend", params={
+            "from": "2026-7-6",
+            "to": "2026-07-10",
+        })
+        assert r.status_code == 422
+
+
+@skip_no_mongo
+class TestDepartmentTrendAggregation:
+    def test_gap_filling_and_moving_average(self, client):
+        """
+        Verify pure MongoDB aggregation:
+        - Gap filling for dates with no attendance logs via $densify
+        - Working days vs weekends
+        - 7-row moving average via $setWindowFields
+        """
+        r = client.get("/analytics/departments/Engineering/trend", params={
+            "from": "2026-07-01",
+            "to": "2026-07-14",
+        })
+        assert r.status_code == 200
+        data = r.json()
+        assert data["department"] == "Engineering"
+        items = data["items"]
+        assert len(items) == 14
+
+        dates = [item["date"] for item in items]
+        assert dates[0] == "2026-07-01"
+        assert dates[-1] == "2026-07-14"
+
+        # Check weekends: 2026-07-04 is Saturday, 2026-07-05 is Sunday
+        sat = next(i for i in items if i["date"] == "2026-07-04")
+        sun = next(i for i in items if i["date"] == "2026-07-05")
+        assert sat["is_working_day"] is False
+        assert sat["attendance_rate"] is None
+        # Preceding rows (July 1, 2, 3) were working days with 0.0 rate, so 7d moving avg is 0.0
+        assert sat["moving_avg_7d"] == 0.0
+
+        assert sun["is_working_day"] is False
+        assert sun["attendance_rate"] is None
+        assert sun["moving_avg_7d"] == 0.0
+
+        # Check working day gap
+        wday = next(i for i in items if i["date"] == "2026-07-01")
+        assert wday["is_working_day"] is True
+        assert wday["present_count"] >= 0.0
+        assert wday["headcount"] >= 1
+
+    def test_weekend_only_trend_returns_null_moving_avg(self, client):
+        """When the range starts on weekend and has no preceding non-null rates, moving_avg_7d is None."""
+        r = client.get("/analytics/departments/Engineering/trend", params={
+            "from": "2026-07-04",
+            "to": "2026-07-05",
+        })
+        assert r.status_code == 200
+        items = r.json()["items"]
+        assert len(items) == 2
+        for item in items:
+            assert item["is_working_day"] is False
+            assert item["attendance_rate"] is None
+            assert item["moving_avg_7d"] is None
+
+    def test_trend_headcount_joined_on(self, client):
+        """Verify R9 headcount: only employees with joined_on <= date are counted."""
+        r = client.get("/analytics/departments/Engineering/trend", params={
+            "from": "2026-07-12",
+            "to": "2026-07-14",
+        })
+        assert r.status_code == 200
+        items = r.json()["items"]
+        # EMP0001 joined 2026-01-05; EMP0002 joined 2026-07-13
+        d12 = next(i for i in items if i["date"] == "2026-07-12")
+        d13 = next(i for i in items if i["date"] == "2026-07-13")
+        assert d13["headcount"] == d12["headcount"] + 1
+
+
+@skip_no_mongo
+class TestExplainFilteringAndIndexes:
+    def test_department_summary_explain_with_department(self, client):
+        """Verify department_summary explain works with department filtering without pipeline errors."""
+        r = client.get("/admin/explain/department_summary", params={
+            "month": "2026-07",
+            "department": "Engineering",
+        })
+        assert r.status_code == 200
+        data = r.json()
+        assert data["endpoint"] == "department_summary"
+        assert "explain" in data
+
+    def test_attendance_list_uses_index(self, client):
+        r = client.get("/admin/explain/attendance_list", params={
+            "emp_code": "EMP0001",
+            "date_from": "2026-07-01",
+            "date_to": "2026-07-31",
+        })
+        assert r.status_code == 200
+        data = r.json()
+        assert "explain" in data
+
+
+@skip_no_mongo
+class TestConcurrency:
+    def test_concurrent_punch_out_race(self, client):
+        """Verify race-safe punch-out: two concurrent requests for the same session result in exactly one 200 and one 409."""
+        emp_code = "EMP0006"
+        ts_in = int(datetime(2026, 7, 8, 4, 0, 0, tzinfo=timezone.utc).timestamp() * 1000)
+        # Punch in
+        p_in = client.post("/attendance/punch-in", json={"emp_code": emp_code, "punched_at": ts_in})
+        assert p_in.status_code in (201, 409)
+
+        ts_out = int(datetime(2026, 7, 8, 13, 0, 0, tzinfo=timezone.utc).timestamp() * 1000)
+
+        def do_punch_out():
+            return client.post("/attendance/punch-out", json={"emp_code": emp_code, "punched_at": ts_out})
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+            f1 = executor.submit(do_punch_out)
+            f2 = executor.submit(do_punch_out)
+            r1 = f1.result()
+            r2 = f2.result()
+
+        statuses = sorted([r1.status_code, r2.status_code])
+        assert statuses == [200, 409]
 
 
 if __name__ == "__main__":

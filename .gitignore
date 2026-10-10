@@ -23,3 +23,9 @@ htmlcov/
 .idea/
 .DS_Store
 Thumbs.db
+
+# Database dumps & backups (CRITICAL: no raw dumps in repository)
+dump/
+*.dump
+*.bson
+*.tar.gz

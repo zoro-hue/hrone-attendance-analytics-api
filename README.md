@@ -93,7 +93,7 @@ candidate_kit/
 ├── sample_data/         # MongoDB Extended JSON sample records
 ├── tests/
 │   ├── __init__.py
-│   └── test_api.py      # Comprehensive pytest test suite (70 unit & integration tests)
+│   └── test_api.py      # Comprehensive pytest test suite (86 unit, integration, and concurrency regression tests)
 ├── DATA_MODEL.md        # Document schemas and sample record reference
 ├── DECISIONS.md         # Architecture, indexing, and concurrency rationale
 ├── openapi.yaml         # Complete OpenAPI 3.0 contract
