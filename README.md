@@ -51,7 +51,7 @@ uvicorn app.main:app --port 8000
 - Health check: `http://localhost:8000/health`
 
 ### 5. Run the Automated Test Suite
-Running the automated integration test suite requires an accessible, compatible MongoDB instance (MongoDB 6.0+ is recommended for `$densify` and `$setWindowFields` support).
+Running the automated integration test suite requires an accessible, compatible MongoDB instance (MongoDB 5.0+ is recommended for `$setWindowFields`, `$dateAdd`, and `$range` support).
 
 > **Warning**: The test suite uses the database specified by `MONGO_DB` (defaulting to `attendance_test_db` during test runs). Test fixtures clean up test data by calling `delete_many({})` between runs. Do not point the test environment to a production or non-test database.
 
@@ -80,8 +80,8 @@ python -m pytest tests/test_api.py -v
    - Atomic document updates ensure concurrent regularizations do not lose history audit logs.
 
 3. **MongoDB Aggregation Pipelines**:
-   - Database-side aggregation pipelines (`$lookup`, `$group`, `$setWindowFields`, `$densify`).
-   - Pure database calculations without in-memory dataset iteration.
+   - Database-side aggregation pipelines (`$lookup`, `$group`, `$setWindowFields`, `$range`, `$dateAdd`).
+   - Pure database calculations without in-memory dataset iteration. Calendar dates across ranges are synthesized natively inside MongoDB, preserving employee-rooted index scans and complete calendar gap filling.
    - Efficient compound index usage and offset/limit pagination (`skip`/`limit`).
 
 4. **Query Plan Explainability**:
@@ -98,7 +98,7 @@ hrone-attendance-analytics-api/
 ├── sample_data/         # MongoDB Extended JSON sample records
 ├── tests/
 │   ├── __init__.py
-│   └── test_api.py      # Automated pytest suite (106 unit, integration, and concurrency regression tests)
+│   └── test_api.py      # Automated pytest suite (107 unit, integration, and concurrency regression tests)
 ├── DATA_MODEL.md        # Document schemas and sample record reference
 ├── DECISIONS.md         # Architecture, indexing, and concurrency rationale (197 words)
 ├── openapi.yaml         # Complete OpenAPI 3.0 contract

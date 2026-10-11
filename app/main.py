@@ -1349,17 +1349,13 @@ def _build_department_trend_pipeline(
     to_date: date,
     emp_codes: list[str],
 ) -> list[dict]:
-    """Build the exact aggregation pipeline for department daily attendance trend."""
-    curr = from_date
-    date_docs = []
-    while curr <= to_date:
-        d_str = curr.isoformat()
-        is_wd = curr.weekday() < 5
-        date_docs.append({
-            "date": d_str,
-            "is_working_day": is_wd
-        })
-        curr += timedelta(days=1)
+    """Build the exact aggregation pipeline for department daily attendance trend.
+
+    Dates in the range are synthesized entirely database-side within MongoDB using
+    $range and $dateAdd, guaranteeing zero Python-side date iteration and full index coverage.
+    """
+    num_days = (to_date - from_date).days + 1
+    from_date_str = from_date.isoformat()
 
     return [
         {"$match": {"department": department}},
@@ -1374,7 +1370,38 @@ def _build_department_trend_pipeline(
                 }
             }
         },
-        {"$addFields": {"dates": date_docs}},
+        {
+            "$addFields": {
+                "dates": {
+                    "$map": {
+                        "input": {"$range": [0, num_days]},
+                        "as": "day_offset",
+                        "in": {
+                            "$let": {
+                                "vars": {
+                                    "d": {
+                                        "$dateAdd": {
+                                            "startDate": {"$dateFromString": {"dateString": from_date_str}},
+                                            "unit": "day",
+                                            "amount": "$$day_offset"
+                                        }
+                                    }
+                                },
+                                "in": {
+                                    "date": {"$dateToString": {"format": "%Y-%m-%d", "date": "$$d"}},
+                                    "is_working_day": {
+                                        "$in": [
+                                            {"$dayOfWeek": "$$d"},
+                                            [2, 3, 4, 5, 6]
+                                        ]
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        },
         {"$unwind": "$dates"},
         {
             "$project": {
