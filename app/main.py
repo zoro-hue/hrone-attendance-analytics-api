@@ -1350,64 +1350,58 @@ def _build_department_trend_pipeline(
     emp_codes: list[str],
 ) -> list[dict]:
     """Build the exact aggregation pipeline for department daily attendance trend."""
-    from_dt = datetime(from_date.year, from_date.month, from_date.day)
-    to_dt_plus_1 = datetime(to_date.year, to_date.month, to_date.day) + timedelta(days=1)
+    curr = from_date
+    date_docs = []
+    while curr <= to_date:
+        d_str = curr.isoformat()
+        is_wd = curr.weekday() < 5
+        date_docs.append({
+            "date": d_str,
+            "is_working_day": is_wd
+        })
+        curr += timedelta(days=1)
 
     return [
+        {"$match": {"department": department}},
         {
-            "$documents": [
-                {"date_dt": from_dt}
-            ]
-        },
-        {
-            "$densify": {
-                "field": "date_dt",
-                "range": {
-                    "step": 1,
-                    "unit": "day",
-                    "bounds": [from_dt, to_dt_plus_1]
+            "$group": {
+                "_id": None,
+                "employees": {
+                    "$push": {
+                        "emp_code": "$emp_code",
+                        "joined_on": "$joined_on"
+                    }
                 }
             }
         },
+        {"$addFields": {"dates": date_docs}},
+        {"$unwind": "$dates"},
         {
             "$project": {
                 "_id": 0,
-                "date": {"$dateToString": {"date": "$date_dt", "format": "%Y-%m-%d"}},
-                "is_working_day": {
-                    "$in": [{"$dayOfWeek": "$date_dt"}, [2, 3, 4, 5, 6]]
-                }
-            }
-        },
-        {
-            "$lookup": {
-                "from": "employees",
-                "let": {"d_str": "$date"},
-                "pipeline": [
-                    {
-                        "$match": {
-                            "$expr": {
-                                "$and": [
-                                    {"$eq": ["$department", department]},
-                                    {"$lte": ["$joined_on", "$$d_str"]}
-                                ]
-                            }
+                "date": "$dates.date",
+                "is_working_day": "$dates.is_working_day",
+                "headcount": {
+                    "$size": {
+                        "$filter": {
+                            "input": "$employees",
+                            "as": "e",
+                            "cond": {"$lte": ["$$e.joined_on", "$dates.date"]}
                         }
-                    },
-                    {"$count": "hc"}
-                ],
-                "as": "hc_docs"
+                    }
+                }
             }
         },
         {
             "$lookup": {
                 "from": "attendance_logs",
-                "let": {"d_str": "$date"},
+                "let": {"curr_date": "$date"},
                 "pipeline": [
                     {
                         "$match": {
                             "$expr": {
                                 "$and": [
-                                    {"$eq": ["$date", "$$d_str"]},
+                                    {"$eq": ["$date", "$$curr_date"]},
                                     {"$in": ["$emp_code", emp_codes]}
                                 ]
                             }
@@ -1442,7 +1436,6 @@ def _build_department_trend_pipeline(
         },
         {
             "$addFields": {
-                "headcount": {"$ifNull": [{"$first": "$hc_docs.hc"}, 0]},
                 "present_count": {"$ifNull": [{"$first": "$att_docs.present_count"}, 0.0]},
                 "late_count": {"$ifNull": [{"$first": "$att_docs.late_count"}, 0]}
             }
@@ -1466,14 +1459,14 @@ def _build_department_trend_pipeline(
                                                 {
                                                     "$multiply": [
                                                         {"$divide": ["$present_count", "$headcount"]},
-                                                        10000,
+                                                        10000
                                                     ]
                                                 },
-                                                0.50000000001,
+                                                0.50000000001
                                             ]
                                         }
                                     },
-                                    10000,
+                                    10000
                                 ]
                             }
                         },
@@ -1497,7 +1490,6 @@ def _build_department_trend_pipeline(
         },
         {
             "$project": {
-                "hc_docs": 0,
                 "att_docs": 0
             }
         }
@@ -1532,7 +1524,7 @@ def department_trend(
     emp_codes = [e["emp_code"] for e in dept_emps]
 
     pipeline = _build_department_trend_pipeline(department, from_date, to_date, emp_codes)
-    raw_items = list(_db.aggregate(pipeline))
+    raw_items = list(_db.employees.aggregate(pipeline))
 
     items = []
     for r in raw_items:
@@ -1711,13 +1703,13 @@ def explain_endpoint(
 
         cmd = {
             "explain": {
-                "aggregate": 1,
+                "aggregate": "employees",
                 "pipeline": pipeline,
                 "cursor": {},
             },
             "verbosity": "executionStats",
         }
         explain = _db.command(cmd)
-        return {"endpoint": endpoint, "collection": "attendance_logs", "explain": _clean_bson(explain)}
+        return {"endpoint": endpoint, "collection": "employees", "explain": _clean_bson(explain)}
 
     raise HTTPException(422, detail="Unknown endpoint")

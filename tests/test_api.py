@@ -974,6 +974,15 @@ class TestDepartmentTrendAggregation:
 class TestExplainFilteringAndIndexes:
     def test_department_summary_explain_with_department(self, client):
         """Verify department_summary explain works with department filtering without pipeline errors and with index scans."""
+        client.post("/employees", json={
+            "emp_code": "EMP0001",
+            "name": "Eng Test",
+            "email": "engtest@example.com",
+            "department": "Engineering",
+            "shift_start": "09:00",
+            "shift_end": "18:00",
+            "joined_on": "2026-07-01",
+        })
         r = client.get("/admin/explain/department_summary", params={
             "month": "2026-07",
             "department": "Engineering",
@@ -1051,6 +1060,15 @@ class TestExplainFilteringAndIndexes:
         assert lookup_stages[0].get("collectionScans", 0) == 0
 
     def test_explain_department_trend_pipeline_fidelity(self, client):
+        client.post("/employees", json={
+            "emp_code": "EMP0001",
+            "name": "Eng Test",
+            "email": "engtest@example.com",
+            "department": "Engineering",
+            "shift_start": "09:00",
+            "shift_end": "18:00",
+            "joined_on": "2026-07-01",
+        })
         r = client.get("/admin/explain/department_trend", params={
             "department": "Engineering",
             "from": "2026-07-01",
@@ -1059,15 +1077,19 @@ class TestExplainFilteringAndIndexes:
         assert r.status_code == 200
         data = r.json()
         assert data["endpoint"] == "department_trend"
+        assert data["collection"] == "employees"
         assert "explain" in data
         exp = data["explain"]
-        # Department trend executes aggregate with $documents root;
-        # Both lookups must use indexes and perform zero collection scans.
+        # Department trend executes aggregate on employees collection;
+        # Root plan must contain literal IXSCAN on department_1_emp_code_1 with 0 COLLSCAN,
+        # and lookup into attendance_logs must use date_-1_emp_code_1 index.
         assert _find_explain_stages(exp, "COLLSCAN") == []
+        ixscans = _find_explain_stages(exp, "IXSCAN")
+        assert len(ixscans) >= 1
+        assert ixscans[0].get("indexName") == "department_1_emp_code_1"
         stages = exp.get("stages", [])
-        assert len(stages) >= 2
         lookup_stages = [s for s in stages if any("lookup" in k for k in s.keys())]
-        assert len(lookup_stages) == 2
+        assert len(lookup_stages) == 1
         for s in lookup_stages:
             assert "indexesUsed" in s
             assert len(s["indexesUsed"]) >= 1
@@ -1089,6 +1111,15 @@ class TestExplainFilteringAndIndexes:
 
     def test_explain_all_five_endpoints_comprehensive_index_verification(self, client):
         """Comprehensive verification: all 5 explain endpoints run against real MongoDB, execute index scans, and have 0 COLLSCAN."""
+        client.post("/employees", json={
+            "emp_code": "EMP0001",
+            "name": "Eng Test",
+            "email": "engtest@example.com",
+            "department": "Engineering",
+            "shift_start": "09:00",
+            "shift_end": "18:00",
+            "joined_on": "2026-07-01",
+        })
         endpoints = [
             ("attendance_list", "/admin/explain/attendance_list?page=1&page_size=5"),
             ("employee_monthly", "/admin/explain/employee_monthly?emp_code=EMP0001&month=2026-07"),
@@ -1103,16 +1134,14 @@ class TestExplainFilteringAndIndexes:
             # Assert 0 collection scans across the board
             collscans = _find_explain_stages(exp, "COLLSCAN")
             assert collscans == [], f"Unexpected COLLSCAN in {name}: {collscans}"
+            ixscans = _find_explain_stages(exp, "IXSCAN")
+            assert len(ixscans) >= 1, f"Expected IXSCAN for {name}"
             if name == "department_trend":
-                # Lookups must report index usage and 0 collection scans
                 lookups = [s for s in exp.get("stages", []) if any("lookup" in k for k in s.keys())]
-                assert len(lookups) == 2
+                assert len(lookups) == 1
                 for lk in lookups:
                     assert len(lk.get("indexesUsed", [])) > 0
                     assert lk.get("collectionScans", 0) == 0
-            else:
-                ixscans = _find_explain_stages(exp, "IXSCAN")
-                assert len(ixscans) >= 1, f"Expected IXSCAN for {name}"
 
 
 @skip_no_mongo
