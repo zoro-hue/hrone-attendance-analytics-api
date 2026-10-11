@@ -1613,6 +1613,7 @@ def explain_endpoint(
             "explain": {
                 "find": "attendance_logs",
                 "filter": q,
+                "projection": {"_id": 0},
                 "sort": {"date": -1, "emp_code": 1},
                 "skip": skip,
                 "limit": page_size,
@@ -1650,7 +1651,10 @@ def explain_endpoint(
         if department:
             emp_codes = [
                 e["emp_code"]
-                for e in _db.employees.find({"department": department}, {"emp_code": 1, "_id": 0})
+                for e in _db.employees.find(
+                    {"department": department, "joined_on": {"$lte": last_day_str}},
+                    {"emp_code": 1, "_id": 0},
+                )
             ]
 
         pipeline = _build_department_summary_att_pipeline(first_day_str, last_day_str, emp_codes, department)

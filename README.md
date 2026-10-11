@@ -71,8 +71,8 @@ python -m pytest tests/test_api.py -v
    - **R4 (Work Hours)**: Decimal-accurate rounding using half-up arithmetic (`ROUND_HALF_UP`).
    - **R5 (Half-Day Threshold)**: Automatically flagged when work hours < 4.50 hours.
    - **R6 & R7 (Presence & Working Days)**: Differentiates working days from non-working days; counts mid-month joiners correctly.
-   - **R8 (Decimal Representation)**: Strict 2 decimal places for hours/counts and 4 decimal places for rates.
-   - **R9 (Headcount)**: Point-in-time headcount by join date regardless of presence in attendance logs.
+   - **R8 (Decimal Representation)**: Strict 2 decimal places for hours/counts and 4 decimal places for rates. Department trend calculates each daily `attendance_rate` rounded half-up to 4 decimal places via `$toDecimal` in MongoDB, and `moving_avg_7d` is the exact mean of defined non-null rates.
+   - **R9 (Headcount & Trend Boundaries)**: Point-in-time headcount by join date regardless of presence in attendance logs. Department trend enforces a strict 92-inclusive-calendar-day boundary (`(to - from).days + 1 <= 92`).
    - **R10 (Pagination)**: 1-indexed pagination with accurate total counts.
 
 2. **Concurrency Safe**:
@@ -98,7 +98,7 @@ hrone-attendance-analytics-api/
 ├── sample_data/         # MongoDB Extended JSON sample records
 ├── tests/
 │   ├── __init__.py
-│   └── test_api.py      # Automated pytest suite (99 unit, integration, and concurrency regression tests)
+│   └── test_api.py      # Automated pytest suite (106 unit, integration, and concurrency regression tests)
 ├── DATA_MODEL.md        # Document schemas and sample record reference
 ├── DECISIONS.md         # Architecture, indexing, and concurrency rationale (197 words)
 ├── openapi.yaml         # Complete OpenAPI 3.0 contract
