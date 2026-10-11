@@ -51,6 +51,10 @@ uvicorn app.main:app --port 8000
 - Health check: `http://localhost:8000/health`
 
 ### 5. Run the Automated Test Suite
+Running the automated integration test suite requires an accessible, compatible MongoDB instance (MongoDB 6.0+ is recommended for `$densify` and `$setWindowFields` support).
+
+> **Warning**: The test suite uses the database specified by `MONGO_DB` (defaulting to `attendance_test_db` during test runs). Test fixtures clean up and delete collections between runs. Do not point the test environment to a production or non-test database.
+
 ```bash
 pip install pytest httpx
 python -m pytest tests/test_api.py -v
@@ -75,13 +79,13 @@ python -m pytest tests/test_api.py -v
    - Unique compound index `(emp_code, date)` guarantees race-safe punch-ins with `409 Conflict` on duplicates.
    - Atomic document updates ensure concurrent regularizations do not lose history audit logs.
 
-3. **High-Performance MongoDB Aggregations**:
+3. **MongoDB Aggregation Pipelines**:
    - Database-side aggregation pipelines (`$lookup`, `$group`, `$setWindowFields`, `$densify`).
    - Pure database calculations without in-memory dataset iteration.
-   - Index-backed execution for fast performance on 100k+ record sets.
+   - Efficient index usage and cursor-based pagination.
 
 4. **Query Plan Explainability**:
-   - `GET /admin/explain/{endpoint}` executes with `executionStats` to verify that all primary queries utilize index scans (`IXSCAN`).
+   - `GET /admin/explain/{endpoint}` executes MongoDB's `explain('executionStats')` on the exact queries and aggregation pipelines used by the operational endpoints.
 
 ---
 
@@ -94,9 +98,9 @@ hrone-attendance-analytics-api/
 ├── sample_data/         # MongoDB Extended JSON sample records
 ├── tests/
 │   ├── __init__.py
-│   └── test_api.py      # Automated pytest suite (95 unit, integration, and concurrency regression tests)
+│   └── test_api.py      # Automated pytest suite (99 unit, integration, and concurrency regression tests)
 ├── DATA_MODEL.md        # Document schemas and sample record reference
-├── DECISIONS.md         # Architecture, indexing, and concurrency rationale (194 words)
+├── DECISIONS.md         # Architecture, indexing, and concurrency rationale (197 words)
 ├── openapi.yaml         # Complete OpenAPI 3.0 contract
 ├── README.md            # Setup and operations documentation
 ├── requirements.txt     # Python dependencies

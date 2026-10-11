@@ -1007,7 +1007,11 @@ class TestExplainFilteringAndIndexes:
         assert data["endpoint"] == "department_trend"
         assert "explain" in data
         exp = data["explain"]
-        assert "executionStats" in exp or ("stages" in exp and "executionStats" in exp["stages"][0].get("$cursor", {}))
+        assert "stages" in exp or "executionStats" in exp
+        if "stages" in exp:
+            stage_str = str(exp["stages"])
+            assert "Densify" in stage_str or "densify" in stage_str
+            assert "SetWindowFields" in stage_str or "setWindowFields" in stage_str
 
     def test_explain_department_trend_validates_dates(self, client):
         r = client.get("/admin/explain/department_trend", params={
@@ -1047,6 +1051,162 @@ class TestConcurrency:
 
         statuses = sorted([r1.status_code, r2.status_code])
         assert statuses == [200, 409]
+
+
+@skip_no_mongo
+class TestPhase3AuditRegressions:
+    def test_punch_out_selection_and_boundaries(self, client):
+        emp_code = "EMP9801"
+        client.post("/employees", json={
+            "emp_code": emp_code,
+            "name": "Audit Test",
+            "email": "audit.test@example.com",
+            "department": "Engineering",
+            "shift_start": "09:00",
+            "shift_end": "18:00",
+            "joined_on": "2026-07-01",
+        })
+        ts_d1_in = int(datetime(2026, 7, 6, 3, 30, 0, tzinfo=timezone.utc).timestamp() * 1000)
+        ts_d2_in = int(datetime(2026, 7, 7, 3, 30, 0, tzinfo=timezone.utc).timestamp() * 1000)
+
+        r_in1 = client.post("/attendance/punch-in", json={"emp_code": emp_code, "punched_at": ts_d1_in})
+        assert r_in1.status_code == 201
+        r_in2 = client.post("/attendance/punch-in", json={"emp_code": emp_code, "punched_at": ts_d2_in})
+        assert r_in2.status_code == 201
+
+        # Backdated punch-out when a later record exists: closes Day 1 record
+        ts_d1_out = int(datetime(2026, 7, 6, 12, 30, 0, tzinfo=timezone.utc).timestamp() * 1000)
+        r_out1 = client.post("/attendance/punch-out", json={"emp_code": emp_code, "punched_at": ts_d1_out})
+        assert r_out1.status_code == 200
+        assert r_out1.json()["date"] == "2026-07-06"
+        assert r_out1.json()["punch_out"] == ts_d1_out
+
+        # Punching out Day 1 again returns 409
+        r_out1_dup = client.post("/attendance/punch-out", json={"emp_code": emp_code, "punched_at": ts_d1_out})
+        assert r_out1_dup.status_code == 409
+
+        # Equal timestamps: punch_out == punch_in -> 422
+        r_eq = client.post("/attendance/punch-out", json={"emp_code": emp_code, "punched_at": ts_d2_in})
+        assert r_eq.status_code == 422
+
+        # Timestamp before first punch-in when punch-in exists -> 422
+        ts_before = ts_d1_in - 3600000
+        r_bef = client.post("/attendance/punch-out", json={"emp_code": emp_code, "punched_at": ts_before})
+        assert r_bef.status_code == 422
+
+        # 24-hour boundary
+        emp_code_24 = "EMP9802"
+        client.post("/employees", json={
+            "emp_code": emp_code_24,
+            "name": "Audit Test 24",
+            "email": "audit24@example.com",
+            "department": "Engineering",
+            "shift_start": "09:00",
+            "shift_end": "18:00",
+            "joined_on": "2026-07-01",
+        })
+        ts_in_24 = int(datetime(2026, 7, 10, 3, 30, 0, tzinfo=timezone.utc).timestamp() * 1000)
+        client.post("/attendance/punch-in", json={"emp_code": emp_code_24, "punched_at": ts_in_24})
+
+        # 24 hours + 1 second -> 422
+        r_exceed = client.post("/attendance/punch-out", json={"emp_code": emp_code_24, "punched_at": ts_in_24 + 86401000})
+        assert r_exceed.status_code == 422
+
+        # Exactly 24 hours -> 200
+        r_exact = client.post("/attendance/punch-out", json={"emp_code": emp_code_24, "punched_at": ts_in_24 + 86400000})
+        assert r_exact.status_code == 200
+
+    def test_trend_range_boundaries(self, client):
+        # Exactly 92 inclusive calendar days: 2026-07-01 to 2026-09-30 (31 + 31 + 30 = 92)
+        r92 = client.get("/analytics/departments/Engineering/trend", params={
+            "from": "2026-07-01",
+            "to": "2026-09-30",
+        })
+        assert r92.status_code == 200
+        assert len(r92.json()["items"]) == 92
+
+        # 93 inclusive calendar days: 2026-07-01 to 2026-10-01 -> 422
+        r93 = client.get("/analytics/departments/Engineering/trend", params={
+            "from": "2026-07-01",
+            "to": "2026-10-01",
+        })
+        assert r93.status_code == 422
+
+        # In explain endpoint as well
+        r_exp92 = client.get("/admin/explain/department_trend", params={
+            "department": "Engineering",
+            "from": "2026-07-01",
+            "to": "2026-09-30",
+        })
+        assert r_exp92.status_code == 200
+
+        r_exp93 = client.get("/admin/explain/department_trend", params={
+            "department": "Engineering",
+            "from": "2026-07-01",
+            "to": "2026-10-01",
+        })
+        assert r_exp93.status_code == 422
+
+    def test_strict_regex_trailing_newlines(self, client):
+        r1 = client.post("/employees", json={
+            "emp_code": "EMP9899\n",
+            "name": "Newline Test",
+            "email": "newline@example.com",
+            "department": "Engineering",
+            "shift_start": "09:00",
+            "shift_end": "18:00",
+            "joined_on": "2026-07-01",
+        })
+        assert r1.status_code == 422
+
+        r2 = client.post("/employees", json={
+            "emp_code": "EMP9899",
+            "name": "Newline Test",
+            "email": "newline@example.com\n",
+            "department": "Engineering",
+            "shift_start": "09:00",
+            "shift_end": "18:00",
+            "joined_on": "2026-07-01",
+        })
+        assert r2.status_code == 422
+
+        r3 = client.post("/employees", json={
+            "emp_code": "EMP9899",
+            "name": "Newline Test",
+            "email": "newline@example.com",
+            "department": "Engineering",
+            "shift_start": "09:00\n",
+            "shift_end": "18:00",
+            "joined_on": "2026-07-01",
+        })
+        assert r3.status_code == 422
+
+    def test_competition_ranking_ties_and_limit_cutoff(self, client):
+        from pymongo import MongoClient
+        client_mongo = MongoClient(os.getenv("MONGO_URI", "mongodb://localhost:27017"))
+        db_mongo = client_mongo[os.getenv("MONGO_DB", "attendance_test_db")]
+        dept = "TieDept"
+        db_mongo.employees.insert_many([
+            {"emp_code": "EMPT001", "name": "Tie 1", "email": "t1@ex.com", "department": dept, "shift_start": "09:00", "shift_end": "18:00", "joined_on": "2026-07-01", "created_at": datetime.now(timezone.utc)},
+            {"emp_code": "EMPT002", "name": "Tie 2", "email": "t2@ex.com", "department": dept, "shift_start": "09:00", "shift_end": "18:00", "joined_on": "2026-07-01", "created_at": datetime.now(timezone.utc)},
+            {"emp_code": "EMPT003", "name": "Tie 3", "email": "t3@ex.com", "department": dept, "shift_start": "09:00", "shift_end": "18:00", "joined_on": "2026-07-01", "created_at": datetime.now(timezone.utc)},
+        ])
+        db_mongo.attendance_logs.insert_many([
+            {"emp_code": "EMPT001", "date": "2026-07-06", "status": "PRESENT", "late_minutes": 30},
+            {"emp_code": "EMPT002", "date": "2026-07-06", "status": "PRESENT", "late_minutes": 20},
+            {"emp_code": "EMPT003", "date": "2026-07-06", "status": "PRESENT", "late_minutes": 20},
+        ])
+        client_mongo.close()
+
+        r = client.get("/analytics/leaderboard/late", params={"month": "2026-07", "department": dept, "limit": 2})
+        assert r.status_code == 200
+        items = r.json()["items"]
+        assert len(items) == 3
+        assert items[0]["emp_code"] == "EMPT001"
+        assert items[0]["rank"] == 1
+        assert items[1]["rank"] == 2
+        assert items[2]["rank"] == 2
+        assert items[1]["emp_code"] < items[2]["emp_code"]
 
 
 if __name__ == "__main__":

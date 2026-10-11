@@ -4,7 +4,6 @@ Run:  uvicorn app.main:app --port 8000
 Env:  MONGO_URI, MONGO_DB (a local .env is loaded for convenience)
 """
 import json
-import math
 import os
 import re
 import calendar
@@ -16,7 +15,7 @@ from typing import Optional, Any, Union
 from bson import json_util
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Query, Path
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, field_validator
 from pymongo import MongoClient, ASCENDING, DESCENDING
 from pymongo.errors import DuplicateKeyError
 
@@ -312,7 +311,7 @@ class EmployeeCreate(BaseModel):
     @field_validator("emp_code")
     @classmethod
     def validate_emp_code(cls, v: str) -> str:
-        if not re.match(r"^EMP\d{4,6}$", v):
+        if not re.match(r"^EMP[0-9]{4,6}\Z", v):
             raise ValueError("emp_code must match pattern EMP followed by 4-6 digits")
         return v
 
@@ -326,7 +325,7 @@ class EmployeeCreate(BaseModel):
     @field_validator("email")
     @classmethod
     def validate_email(cls, v: str) -> str:
-        if len(v) > 120 or not re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", v):
+        if len(v) > 120 or not re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+\Z", v):
             raise ValueError("Invalid email format")
         return v
 
@@ -340,14 +339,14 @@ class EmployeeCreate(BaseModel):
     @field_validator("shift_start", "shift_end")
     @classmethod
     def validate_shift_time(cls, v: str) -> str:
-        if not re.match(r"^([01]\d|2[0-3]):[0-5]\d$", v):
+        if not re.match(r"^([01][0-9]|2[0-3]):[0-5][0-9]\Z", v):
             raise ValueError("Shift time must be HH:MM (24-hour)")
         return v
 
     @field_validator("joined_on")
     @classmethod
     def validate_joined_on(cls, v: str) -> str:
-        if not isinstance(v, str) or not re.match(r"^\d{4}-(0[1-9]|1[0-2])-(0[1-9]|[12]\d|3[01])$", v):
+        if not isinstance(v, str) or not re.match(r"^[0-9]{4}-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])\Z", v):
             raise ValueError("joined_on must be exact YYYY-MM-DD")
         try:
             datetime.strptime(v, "%Y-%m-%d")
@@ -451,7 +450,7 @@ class RegularizeRequest(BaseModel):
 
 def _validate_month(month: str) -> tuple[str, str]:
     """Validate YYYY-MM format and return (first_day, last_day) as YYYY-MM-DD strings."""
-    if not re.match(r"^\d{4}-(0[1-9]|1[0-2])$", month):
+    if not re.match(r"^[0-9]{4}-(0[1-9]|1[0-2])\Z", month):
         raise HTTPException(422, detail="month must be YYYY-MM format")
     year, mon = map(int, month.split("-"))
     _, last = calendar.monthrange(year, mon)
@@ -460,7 +459,7 @@ def _validate_month(month: str) -> tuple[str, str]:
 
 def _validate_date(d: str) -> date:
     """Parse and validate an exact YYYY-MM-DD date string representing a valid calendar date."""
-    if not isinstance(d, str) or not re.match(r"^\d{4}-(0[1-9]|1[0-2])-(0[1-9]|[12]\d|3[01])$", d):
+    if not isinstance(d, str) or not re.match(r"^[0-9]{4}-(0[1-9]|1[0-2])-(0[1-9]|[12][0-9]|3[01])\Z", d):
         raise HTTPException(422, detail=f"Invalid date format (must be YYYY-MM-DD): {d}")
     try:
         return datetime.strptime(d, "%Y-%m-%d").date()
@@ -598,16 +597,23 @@ def punch_out(body: PunchOutRequest):
         now = datetime.now(tz=timezone.utc)
         ts = now.replace(microsecond=0)
 
-    # Find the most recent record with a punch-in for this employee
+    # Find the most recent record whose punch_in is at or before punched_at (OpenAPI contract)
     record = _db.attendance_logs.find_one(
         {
             "emp_code": body.emp_code,
-            "punch_in": {"$ne": None},
+            "punch_in": {"$lte": ts, "$ne": None},
         },
         sort=[("punch_in", DESCENDING)],
     )
 
     if not record:
+        # If no record at or before ts, check if any punch-in exists for this employee
+        any_punch = _db.attendance_logs.find_one(
+            {"emp_code": body.emp_code, "punch_in": {"$ne": None}}
+        )
+        if any_punch:
+            # All punch-ins are later than punched_at (punched_at <= punch_in) -> 422
+            raise HTTPException(422, detail="punch_out must be after punch_in")
         raise HTTPException(404, detail="No punch-in found for this employee")
 
     if record.get("punch_out") is not None:
@@ -615,7 +621,7 @@ def punch_out(body: PunchOutRequest):
 
     punch_in_dt = _ensure_aware(record["punch_in"])
 
-    # Validate: punched_at must be > punch_in
+    # Validate: punched_at must be > punch_in (e.g. equal timestamps -> 422)
     if ts <= punch_in_dt:
         raise HTTPException(422, detail="punch_out must be after punch_in")
 
@@ -1311,36 +1317,19 @@ def late_leaderboard(
 
 
 # ---------------------------------------------------------------------------
-# GET /analytics/departments/{department}/trend
+# Department Trend pipeline helper
 # ---------------------------------------------------------------------------
-@app.get("/analytics/departments/{department}/trend")
-def department_trend(
-    department: str = Path(...),
-    date_from: str = Query(..., alias="from"),
-    date_to: str = Query(..., alias="to"),
-):
-    _db = get_db()
-
-    from_date = _validate_date(date_from)
-    to_date = _validate_date(date_to)
-
-    if to_date < from_date:
-        raise HTTPException(422, detail="'to' must not be before 'from'")
-    if (to_date - from_date).days > 92:
-        raise HTTPException(422, detail="Date range must not exceed 92 days")
-
-    # Check department exists
-    dept_exists = _db.employees.find_one({"department": department})
-    if not dept_exists:
-        raise HTTPException(404, detail="Unknown department (no employees)")
-
+def _build_department_trend_pipeline(
+    department: str,
+    from_date: date,
+    to_date: date,
+    emp_codes: list[str],
+) -> list[dict]:
+    """Build the exact aggregation pipeline for department daily attendance trend."""
     from_dt = datetime(from_date.year, from_date.month, from_date.day)
     to_dt_plus_1 = datetime(to_date.year, to_date.month, to_date.day) + timedelta(days=1)
 
-    dept_emps = list(_db.employees.find({"department": department}, {"_id": 0, "emp_code": 1}))
-    emp_codes = [e["emp_code"] for e in dept_emps]
-
-    pipeline = [
+    return [
         {
             "$documents": [
                 {"date_dt": from_dt}
@@ -1471,6 +1460,35 @@ def department_trend(
         }
     ]
 
+
+# ---------------------------------------------------------------------------
+# GET /analytics/departments/{department}/trend
+# ---------------------------------------------------------------------------
+@app.get("/analytics/departments/{department}/trend")
+def department_trend(
+    department: str = Path(...),
+    date_from: str = Query(..., alias="from"),
+    date_to: str = Query(..., alias="to"),
+):
+    _db = get_db()
+
+    from_date = _validate_date(date_from)
+    to_date = _validate_date(date_to)
+
+    if to_date < from_date:
+        raise HTTPException(422, detail="'to' must not be before 'from'")
+    if (to_date - from_date).days + 1 > 92:
+        raise HTTPException(422, detail="Date range must not exceed 92 days")
+
+    # Check department exists
+    dept_exists = _db.employees.find_one({"department": department})
+    if not dept_exists:
+        raise HTTPException(404, detail="Unknown department (no employees)")
+
+    dept_emps = list(_db.employees.find({"department": department}, {"_id": 0, "emp_code": 1}))
+    emp_codes = [e["emp_code"] for e in dept_emps]
+
+    pipeline = _build_department_trend_pipeline(department, from_date, to_date, emp_codes)
     raw_items = list(_db.aggregate(pipeline))
 
     items = []
@@ -1629,10 +1647,12 @@ def explain_endpoint(
         if not f or not t:
             raise HTTPException(422, detail="from and to are required for department_trend")
 
-        _validate_date(f)
-        _validate_date(t)
-        if f > t:
+        f_date = _validate_date(f)
+        t_date = _validate_date(t)
+        if t_date < f_date:
             raise HTTPException(422, detail="'to' must not be before 'from'")
+        if (t_date - f_date).days + 1 > 92:
+            raise HTTPException(422, detail="Date range must not exceed 92 days")
 
         # Get emp_codes in department
         emp_codes = [
@@ -1640,42 +1660,11 @@ def explain_endpoint(
             for e in _db.employees.find({"department": department}, {"emp_code": 1, "_id": 0})
         ]
 
-        pipeline = [
-            {
-                "$match": {
-                    "date": {"$gte": f, "$lte": t},
-                    "emp_code": {"$in": emp_codes},
-                }
-            },
-            {
-                "$group": {
-                    "_id": "$date",
-                    "present_count": {
-                        "$sum": {
-                            "$cond": [
-                                {"$in": ["$status", list(PRESENCE_STATUSES)]},
-                                {"$cond": [{"$eq": ["$half_day", True]}, 0.5, 1.0]},
-                                0.0,
-                            ]
-                        }
-                    },
-                    "late_count": {
-                        "$sum": {
-                            "$cond": [
-                                {"$gt": [{"$ifNull": ["$late_minutes", 0]}, 0]},
-                                1,
-                                0,
-                            ]
-                        }
-                    },
-                }
-            },
-            {"$sort": {"_id": 1}},
-        ]
+        pipeline = _build_department_trend_pipeline(department, f_date, t_date, emp_codes)
 
         cmd = {
             "explain": {
-                "aggregate": "attendance_logs",
+                "aggregate": 1,
                 "pipeline": pipeline,
                 "cursor": {},
             },
