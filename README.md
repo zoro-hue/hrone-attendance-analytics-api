@@ -51,7 +51,7 @@ uvicorn app.main:app --port 8000
 - Health check: `http://localhost:8000/health`
 
 ### 5. Run the Automated Test Suite
-Running the automated integration test suite requires an accessible, compatible MongoDB instance (MongoDB 5.0+ is recommended for `$setWindowFields`, `$dateAdd`, and `$range` support).
+Running the automated integration test suite requires an accessible MongoDB 6.0+ instance. The application uses MongoDB aggregation features including `$setWindowFields`, `$dateAdd`, and `$range`.
 
 > **Warning**: The test suite uses the database specified by `MONGO_DB` (defaulting to `attendance_test_db` during test runs). Test fixtures clean up test data by calling `delete_many({})` between runs. Do not point the test environment to a production or non-test database.
 
