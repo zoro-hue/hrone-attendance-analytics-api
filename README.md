@@ -98,7 +98,7 @@ hrone-attendance-analytics-api/
 ├── sample_data/         # MongoDB Extended JSON sample records
 ├── tests/
 │   ├── __init__.py
-│   └── test_api.py      # Automated pytest suite (107 unit, integration, and concurrency regression tests)
+│   └── test_api.py      # Automated pytest suite (109 unit, integration, and concurrency regression tests)
 ├── DATA_MODEL.md        # Document schemas and sample record reference
 ├── DECISIONS.md         # Architecture, indexing, and concurrency rationale (197 words)
 ├── openapi.yaml         # Complete OpenAPI 3.0 contract

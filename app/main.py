@@ -995,7 +995,7 @@ def employee_monthly(
         d += timedelta(days=1)
 
     # Aggregation pipeline
-    pipeline = _build_employee_monthly_pipeline(emp_code, first_day_str, last_day_str)
+    pipeline = _build_employee_monthly_pipeline(emp_code, count_from.isoformat(), last_day_str)
     results = list(_db.attendance_logs.aggregate(pipeline))
 
     if results:
@@ -1413,23 +1413,36 @@ def _build_department_trend_pipeline(
                         "$filter": {
                             "input": "$employees",
                             "as": "e",
-                            "cond": {"$lte": ["$$e.joined_on", "$dates.date"]}
+                            "cond": {"$lte": ["$$e.joined_on", "$dates.date"]},
                         }
                     }
-                }
+                },
+                "active_emp_codes": {
+                    "$map": {
+                        "input": {
+                            "$filter": {
+                                "input": "$employees",
+                                "as": "e",
+                                "cond": {"$lte": ["$$e.joined_on", "$dates.date"]},
+                            }
+                        },
+                        "as": "e",
+                        "in": "$$e.emp_code",
+                    }
+                },
             }
         },
         {
             "$lookup": {
                 "from": "attendance_logs",
-                "let": {"curr_date": "$date"},
+                "let": {"curr_date": "$date", "active_emps": "$active_emp_codes"},
                 "pipeline": [
                     {
                         "$match": {
                             "$expr": {
                                 "$and": [
                                     {"$eq": ["$date", "$$curr_date"]},
-                                    {"$in": ["$emp_code", emp_codes]}
+                                    {"$in": ["$emp_code", "$$active_emps"]},
                                 ]
                             }
                         }
@@ -1649,7 +1662,13 @@ def explain_endpoint(
             raise HTTPException(422, detail="month is required for employee_monthly")
 
         first_day_str, last_day_str = _validate_month(month)
-        pipeline = _build_employee_monthly_pipeline(emp_code, first_day_str, last_day_str)
+        emp = _db.employees.find_one({"emp_code": emp_code})
+        if emp and "joined_on" in emp:
+            joined = date.fromisoformat(emp["joined_on"])
+            count_from = max(date.fromisoformat(first_day_str), joined)
+            pipeline = _build_employee_monthly_pipeline(emp_code, count_from.isoformat(), last_day_str)
+        else:
+            pipeline = _build_employee_monthly_pipeline(emp_code, first_day_str, last_day_str)
         cmd = {
             "explain": {
                 "aggregate": "attendance_logs",

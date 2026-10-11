@@ -1523,6 +1523,147 @@ class TestPhase3AuditRegressions:
         assert "detail" in r_handler.json()
         assert r_handler.json()["detail"] == "'to' must not be before 'from'"
 
+    def test_trend_excludes_pre_joining_attendance_from_headcount_and_rate(self, client):
+        """Pre-joining attendance records must not count towards headcount, present_count, or rate > 100%."""
+        dept = "TrendPreJoinDept"
+        emp1 = "EMP9985"
+        emp2 = "EMP9987"
+        from pymongo import MongoClient
+        client_mongo = MongoClient(os.getenv("MONGO_URI", "mongodb://localhost:27017"))
+        db_mongo = client_mongo[os.getenv("MONGO_DB", "attendance_test_db")]
+
+        try:
+            # emp1 joins on 2026-07-01
+            r1 = client.post("/employees", json={
+                "emp_code": emp1,
+                "name": "Trend Early Join",
+                "email": "early@example.com",
+                "department": dept,
+                "shift_start": "09:00",
+                "shift_end": "18:00",
+                "joined_on": "2026-07-01",
+            })
+            assert r1.status_code == 201
+            # emp2 joins on 2026-07-15
+            r2 = client.post("/employees", json={
+                "emp_code": emp2,
+                "name": "Trend Mid Join",
+                "email": "mid@example.com",
+                "department": dept,
+                "shift_start": "09:00",
+                "shift_end": "18:00",
+                "joined_on": "2026-07-15",
+            })
+            assert r2.status_code == 201
+
+            # On 2026-07-10 (working day Friday): emp1 is absent, but emp2 has a pre-joining punch
+            # On 2026-07-16 (working day Thursday): both emp1 and emp2 have valid punches
+            db_mongo.attendance_logs.insert_many([
+                {
+                    "emp_code": emp2,
+                    "date": "2026-07-10",
+                    "status": "PRESENT",
+                    "half_day": False,
+                    "late_minutes": 0,
+                    "overtime_minutes": 0,
+                },
+                {
+                    "emp_code": emp1,
+                    "date": "2026-07-16",
+                    "status": "PRESENT",
+                    "half_day": False,
+                    "late_minutes": 0,
+                    "overtime_minutes": 0,
+                },
+                {
+                    "emp_code": emp2,
+                    "date": "2026-07-16",
+                    "status": "PRESENT",
+                    "half_day": False,
+                    "late_minutes": 0,
+                    "overtime_minutes": 0,
+                },
+            ])
+
+            resp = client.get(f"/analytics/departments/{dept}/trend", params={"from": "2026-07-10", "to": "2026-07-16"})
+            assert resp.status_code == 200
+            days = {d["date"]: d for d in resp.json()["items"]}
+
+            # On 2026-07-10: only emp1 joined (headcount=1). emp1 was absent, emp2 pre-joining punch MUST be ignored.
+            # present_count must be 0.0, and attendance_rate must be 0.0 (never 100% or >100%)
+            assert days["2026-07-10"]["headcount"] == 1
+            assert days["2026-07-10"]["present_count"] == 0.0
+            assert days["2026-07-10"]["attendance_rate"] == 0.0
+
+            # On 2026-07-16: both emp1 and emp2 are active (headcount=2). Both present.
+            assert days["2026-07-16"]["headcount"] == 2
+            assert days["2026-07-16"]["present_count"] == 2.0
+            assert days["2026-07-16"]["attendance_rate"] == 1.0
+        finally:
+            db_mongo.employees.delete_many({"emp_code": {"$in": [emp1, emp2]}})
+            db_mongo.attendance_logs.delete_many({"emp_code": {"$in": [emp1, emp2]}})
+            client_mongo.close()
+
+    def test_employee_monthly_mid_month_joiner_ignores_pre_joining_logs(self, client):
+        """Attendance logs dated before joined_on must not inflate present_days or attendance_pct above 100%."""
+        emp_code = "EMP9986"
+        from pymongo import MongoClient
+        client_mongo = MongoClient(os.getenv("MONGO_URI", "mongodb://localhost:27017"))
+        db_mongo = client_mongo[os.getenv("MONGO_DB", "attendance_test_db")]
+
+        try:
+            r_create = client.post("/employees", json={
+                "emp_code": emp_code,
+                "name": "Monthly PreJoin",
+                "email": "monthlyprejoin@example.com",
+                "department": "Engineering",
+                "shift_start": "09:00",
+                "shift_end": "18:00",
+                "joined_on": "2026-07-15",
+            })
+            assert r_create.status_code == 201
+
+            # Insert 2 pre-joining punches (2026-07-02, 2026-07-03) and 1 post-joining punch (2026-07-16)
+            db_mongo.attendance_logs.insert_many([
+                {
+                    "emp_code": emp_code,
+                    "date": "2026-07-02",
+                    "status": "PRESENT",
+                    "half_day": False,
+                    "late_minutes": 0,
+                    "overtime_minutes": 0,
+                },
+                {
+                    "emp_code": emp_code,
+                    "date": "2026-07-03",
+                    "status": "PRESENT",
+                    "half_day": False,
+                    "late_minutes": 0,
+                    "overtime_minutes": 0,
+                },
+                {
+                    "emp_code": emp_code,
+                    "date": "2026-07-16",
+                    "status": "PRESENT",
+                    "half_day": False,
+                    "late_minutes": 0,
+                    "overtime_minutes": 0,
+                },
+            ])
+
+            resp = client.get(f"/analytics/employees/{emp_code}/monthly", params={"month": "2026-07"})
+            assert resp.status_code == 200
+            data = resp.json()
+            assert data["working_days"] == 13  # Mon-Fri from 2026-07-15 to 2026-07-31
+            assert data["present_days"] == 1.0  # Only 2026-07-16 counts, pre-joining logs ignored
+            assert data["leave_days"] == 0
+            assert data["attendance_pct"] == 7.69  # 1.0 / 13 * 100 rounded to 2 decimals
+        finally:
+            db_mongo.employees.delete_many({"emp_code": emp_code})
+            db_mongo.attendance_logs.delete_many({"emp_code": emp_code})
+            client_mongo.close()
+
+
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v", "--tb=short"])
