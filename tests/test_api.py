@@ -22,6 +22,7 @@ from app.main import (
     app, epoch_ms_to_datetime, datetime_to_epoch_ms,
     compute_attendance_date, compute_late_minutes, compute_work_hours,
     compute_overtime, compute_half_day, round_half_up,
+    _build_department_trend_pipeline,
     IST,
 )
 
@@ -906,7 +907,7 @@ class TestDepartmentTrendAggregation:
     def test_gap_filling_and_moving_average(self, client):
         """
         Verify pure MongoDB aggregation:
-        - Gap filling for dates with no attendance logs via $densify
+        - Gap filling for dates with no attendance logs via database-side $range and $dateAdd
         - Working days vs weekends
         - 7-row moving average via $setWindowFields
         """
@@ -968,6 +969,18 @@ class TestDepartmentTrendAggregation:
         d12 = next(i for i in items if i["date"] == "2026-07-12")
         d13 = next(i for i in items if i["date"] == "2026-07-13")
         assert d13["headcount"] == d12["headcount"] + 1
+
+    def test_trend_pipeline_uses_database_side_date_generation(self):
+        """Verify _build_department_trend_pipeline synthesizes calendar dates in MongoDB ($range, $dateAdd) without Python date loops."""
+        p = _build_department_trend_pipeline("Engineering", date(2026, 7, 1), date(2026, 7, 10), ["EMP0001"])
+        add_fields = next(s for s in p if "$addFields" in s and "dates" in s["$addFields"])
+        dates_expr = add_fields["$addFields"]["dates"]
+        assert "$map" in dates_expr
+        assert dates_expr["$map"]["input"] == {"$range": [0, 10]}
+        vars_map = dates_expr["$map"]["in"]["$let"]["vars"]
+        assert "$dateAdd" in vars_map["d"]
+        assert vars_map["d"]["$dateAdd"]["amount"] == "$$day_offset"
+        assert vars_map["d"]["$dateAdd"]["unit"] == "day"
 
 
 @skip_no_mongo
