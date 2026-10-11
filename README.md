@@ -53,7 +53,7 @@ uvicorn app.main:app --port 8000
 ### 5. Run the Automated Test Suite
 Running the automated integration test suite requires an accessible, compatible MongoDB instance (MongoDB 6.0+ is recommended for `$densify` and `$setWindowFields` support).
 
-> **Warning**: The test suite uses the database specified by `MONGO_DB` (defaulting to `attendance_test_db` during test runs). Test fixtures clean up and delete collections between runs. Do not point the test environment to a production or non-test database.
+> **Warning**: The test suite uses the database specified by `MONGO_DB` (defaulting to `attendance_test_db` during test runs). Test fixtures clean up test data by calling `delete_many({})` between runs. Do not point the test environment to a production or non-test database.
 
 ```bash
 pip install pytest httpx
@@ -82,7 +82,7 @@ python -m pytest tests/test_api.py -v
 3. **MongoDB Aggregation Pipelines**:
    - Database-side aggregation pipelines (`$lookup`, `$group`, `$setWindowFields`, `$densify`).
    - Pure database calculations without in-memory dataset iteration.
-   - Efficient index usage and cursor-based pagination.
+   - Efficient compound index usage and offset/limit pagination (`skip`/`limit`).
 
 4. **Query Plan Explainability**:
    - `GET /admin/explain/{endpoint}` executes MongoDB's `explain('executionStats')` on the exact queries and aggregation pipelines used by the operational endpoints.

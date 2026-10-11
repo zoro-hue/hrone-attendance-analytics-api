@@ -41,7 +41,7 @@ In accordance with Problem Statement Section 8 ("Also mention anything you exami
    Examined whether custom middleware was necessary for malformed JSON bodies and query parameters. FastAPI's built-in Pydantic integration natively catches type mismatches, missing fields, and regex violations, returning compliant HTTP 422 Unprocessable Entity responses.
 
 3. **Atomic Regularization Updates**:
-   Examined `regularize_attendance` concurrency. Using MongoDB's atomic `update_one` with a history length condition `{"history": {"$size": len(current_history)}}` guarantees optimistic concurrency control: concurrent modifications are safely rejected with HTTP 409 Conflict rather than silently dropping changes or audit history, without requiring multi-document distributed transactions.
+   Examined `regularize_attendance` concurrency. Using MongoDB's atomic `update_one` with the optimistic concurrency filter `{"$expr": {"$eq": [{"$size": {"$ifNull": ["$history", []]}}, old_history_len]}}` guarantees optimistic concurrency control: concurrent modifications are safely rejected with HTTP 409 Conflict rather than silently dropping changes or audit history, without requiring multi-document distributed transactions.
 
 4. **Grace Period Equality Boundary**:
    Examined Rule R2 behavior when punch-in occurs exactly at `shift_start + grace_period` (e.g. 09:40:00 for a 09:30 shift with 10-minute grace). The contract specifies late minutes are counted when `punch_in > shift_start + grace_period`. The starter's conditional operator correctly treats arrival within or exactly at the grace boundary as 0 late minutes.

@@ -67,6 +67,21 @@ def client():
         mongo.close()
 
 
+def _find_explain_stages(obj, target):
+    """Recursively find all stages matching target in explain plan."""
+    found = []
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            if k == "stage" and v == target:
+                found.append(obj)
+            else:
+                found.extend(_find_explain_stages(v, target))
+    elif isinstance(obj, list):
+        for item in obj:
+            found.extend(_find_explain_stages(item, target))
+    return found
+
+
 # ---------------------------------------------------------------------------
 # Unit tests for helpers (no DB required)
 # ---------------------------------------------------------------------------
@@ -216,6 +231,24 @@ class TestHealth:
         r = client.get("/health")
         assert r.status_code == 200
         assert r.json() == {"status": "ok"}
+
+    def test_health_timeout_when_mongo_down(self, client):
+        """When MongoDB is unreachable, /health must return 503 promptly within <= 3.5s."""
+        from unittest.mock import MagicMock
+        mock_db = MagicMock()
+        mock_db.command.side_effect = Exception("MongoDB connection refused")
+        with patch("app.main.get_db", return_value=mock_db):
+            start = time.perf_counter()
+            r = client.get("/health")
+            elapsed = time.perf_counter() - start
+            assert r.status_code == 503
+            assert elapsed < 3.5
+
+    def test_health_short_server_selection_timeout(self, client):
+        """Verify MongoClient serverSelectionTimeoutMS configuration is 3000ms (3.0s)."""
+        import app.main as app_main
+        assert app_main.client is not None
+        assert app_main.client.options.server_selection_timeout == 3.0
 
 
 @skip_no_mongo
@@ -940,7 +973,7 @@ class TestDepartmentTrendAggregation:
 @skip_no_mongo
 class TestExplainFilteringAndIndexes:
     def test_department_summary_explain_with_department(self, client):
-        """Verify department_summary explain works with department filtering without pipeline errors."""
+        """Verify department_summary explain works with department filtering without pipeline errors and with index scans."""
         r = client.get("/admin/explain/department_summary", params={
             "month": "2026-07",
             "department": "Engineering",
@@ -949,6 +982,14 @@ class TestExplainFilteringAndIndexes:
         data = r.json()
         assert data["endpoint"] == "department_summary"
         assert "explain" in data
+        exp = data["explain"]
+        assert _find_explain_stages(exp, "COLLSCAN") == []
+        assert len(_find_explain_stages(exp, "IXSCAN")) >= 1
+        # Also verify lookup stage uses index
+        lookup_stages = [s for s in exp.get("stages", []) if any("lookup" in k for k in s.keys())]
+        assert len(lookup_stages) >= 1
+        assert "indexesUsed" in lookup_stages[0]
+        assert lookup_stages[0].get("collectionScans", 0) == 0
 
     def test_attendance_list_uses_index(self, client):
         r = client.get("/admin/explain/attendance_list", params={
@@ -959,6 +1000,11 @@ class TestExplainFilteringAndIndexes:
         assert r.status_code == 200
         data = r.json()
         assert "explain" in data
+        exp = data["explain"]
+        assert _find_explain_stages(exp, "COLLSCAN") == []
+        ixscans = _find_explain_stages(exp, "IXSCAN")
+        assert len(ixscans) >= 1
+        assert ixscans[0].get("indexName") in ("date_-1_emp_code_1", "emp_code_1_date_1")
 
     def test_explain_attendance_list_validates_dates_and_status(self, client):
         # Invalid calendar date
@@ -981,7 +1027,10 @@ class TestExplainFilteringAndIndexes:
         assert data["endpoint"] == "employee_monthly"
         assert "explain" in data
         exp = data["explain"]
-        assert "executionStats" in exp or ("stages" in exp and "executionStats" in exp["stages"][0].get("$cursor", {}))
+        assert _find_explain_stages(exp, "COLLSCAN") == []
+        ixscans = _find_explain_stages(exp, "IXSCAN")
+        assert len(ixscans) >= 1
+        assert ixscans[0].get("indexName") == "emp_code_1_date_1"
 
     def test_explain_late_leaderboard_pipeline_fidelity(self, client):
         r = client.get("/admin/explain/late_leaderboard", params={
@@ -994,7 +1043,12 @@ class TestExplainFilteringAndIndexes:
         assert data["endpoint"] == "late_leaderboard"
         assert "explain" in data
         exp = data["explain"]
-        assert "executionStats" in exp or ("stages" in exp and "executionStats" in exp["stages"][0].get("$cursor", {}))
+        assert _find_explain_stages(exp, "COLLSCAN") == []
+        assert len(_find_explain_stages(exp, "IXSCAN")) >= 1
+        lookup_stages = [s for s in exp.get("stages", []) if any("lookup" in k for k in s.keys())]
+        assert len(lookup_stages) >= 1
+        assert "indexesUsed" in lookup_stages[0]
+        assert lookup_stages[0].get("collectionScans", 0) == 0
 
     def test_explain_department_trend_pipeline_fidelity(self, client):
         r = client.get("/admin/explain/department_trend", params={
@@ -1007,11 +1061,17 @@ class TestExplainFilteringAndIndexes:
         assert data["endpoint"] == "department_trend"
         assert "explain" in data
         exp = data["explain"]
-        assert "stages" in exp or "executionStats" in exp
-        if "stages" in exp:
-            stage_str = str(exp["stages"])
-            assert "Densify" in stage_str or "densify" in stage_str
-            assert "SetWindowFields" in stage_str or "setWindowFields" in stage_str
+        # Department trend executes aggregate with $documents root;
+        # Both lookups must use indexes and perform zero collection scans.
+        assert _find_explain_stages(exp, "COLLSCAN") == []
+        stages = exp.get("stages", [])
+        assert len(stages) >= 2
+        lookup_stages = [s for s in stages if any("lookup" in k for k in s.keys())]
+        assert len(lookup_stages) == 2
+        for s in lookup_stages:
+            assert "indexesUsed" in s
+            assert len(s["indexesUsed"]) >= 1
+            assert s.get("collectionScans", 0) == 0
 
     def test_explain_department_trend_validates_dates(self, client):
         r = client.get("/admin/explain/department_trend", params={
@@ -1027,12 +1087,48 @@ class TestExplainFilteringAndIndexes:
         })
         assert r.status_code == 422
 
+    def test_explain_all_five_endpoints_comprehensive_index_verification(self, client):
+        """Comprehensive verification: all 5 explain endpoints run against real MongoDB, execute index scans, and have 0 COLLSCAN."""
+        endpoints = [
+            ("attendance_list", "/admin/explain/attendance_list?page=1&page_size=5"),
+            ("employee_monthly", "/admin/explain/employee_monthly?emp_code=EMP0001&month=2026-07"),
+            ("department_summary", "/admin/explain/department_summary?month=2026-07&department=Engineering"),
+            ("late_leaderboard", "/admin/explain/late_leaderboard?month=2026-07&limit=5"),
+            ("department_trend", "/admin/explain/department_trend?department=Engineering&from=2026-07-06&to=2026-07-10")
+        ]
+        for name, url in endpoints:
+            r = client.get(url)
+            assert r.status_code == 200, f"Explain failed for {name}"
+            exp = r.json()["explain"]
+            # Assert 0 collection scans across the board
+            collscans = _find_explain_stages(exp, "COLLSCAN")
+            assert collscans == [], f"Unexpected COLLSCAN in {name}: {collscans}"
+            if name == "department_trend":
+                # Lookups must report index usage and 0 collection scans
+                lookups = [s for s in exp.get("stages", []) if any("lookup" in k for k in s.keys())]
+                assert len(lookups) == 2
+                for lk in lookups:
+                    assert len(lk.get("indexesUsed", [])) > 0
+                    assert lk.get("collectionScans", 0) == 0
+            else:
+                ixscans = _find_explain_stages(exp, "IXSCAN")
+                assert len(ixscans) >= 1, f"Expected IXSCAN for {name}"
+
 
 @skip_no_mongo
 class TestConcurrency:
     def test_concurrent_punch_out_race(self, client):
         """Verify race-safe punch-out: two concurrent requests for the same session result in exactly one 200 and one 409."""
-        emp_code = "EMP0006"
+        emp_code = "EMP9981"
+        client.post("/employees", json={
+            "emp_code": emp_code,
+            "name": "Conc Out",
+            "email": "cout@example.com",
+            "department": "Engineering",
+            "shift_start": "09:00",
+            "shift_end": "18:00",
+            "joined_on": "2026-07-01",
+        })
         ts_in = int(datetime(2026, 7, 8, 4, 0, 0, tzinfo=timezone.utc).timestamp() * 1000)
         # Punch in
         p_in = client.post("/attendance/punch-in", json={"emp_code": emp_code, "punched_at": ts_in})
@@ -1051,6 +1147,32 @@ class TestConcurrency:
 
         statuses = sorted([r1.status_code, r2.status_code])
         assert statuses == [200, 409]
+
+    def test_concurrent_punch_in_race(self, client):
+        """Verify race-safe punch-in: two concurrent requests for the same employee and date result in exactly one 201 and one 409."""
+        emp_code = "EMP9982"
+        client.post("/employees", json={
+            "emp_code": emp_code,
+            "name": "Conc In",
+            "email": "cin@example.com",
+            "department": "Engineering",
+            "shift_start": "09:00",
+            "shift_end": "18:00",
+            "joined_on": "2026-07-01",
+        })
+        ts_in = int(datetime(2026, 7, 9, 4, 0, 0, tzinfo=timezone.utc).timestamp() * 1000)
+
+        def do_punch_in():
+            return client.post("/attendance/punch-in", json={"emp_code": emp_code, "punched_at": ts_in})
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+            f1 = executor.submit(do_punch_in)
+            f2 = executor.submit(do_punch_in)
+            r1 = f1.result()
+            r2 = f2.result()
+
+        statuses = sorted([r1.status_code, r2.status_code])
+        assert statuses == [201, 409]
 
 
 @skip_no_mongo
@@ -1207,6 +1329,157 @@ class TestPhase3AuditRegressions:
         assert items[1]["rank"] == 2
         assert items[2]["rank"] == 2
         assert items[1]["emp_code"] < items[2]["emp_code"]
+
+    def test_trend_moving_average_rounding_boundary(self, client):
+        """Verify moving_avg_7d calculates the mean of defined non-null 4-decimal attendance_rate values."""
+        from pymongo import MongoClient
+        client_mongo = MongoClient(os.getenv("MONGO_URI", "mongodb://localhost:27017"))
+        db_mongo = client_mongo[os.getenv("MONGO_DB", "attendance_test_db")]
+        dept = "RoundingDept"
+        # Insert 7 employees joining on 2026-07-01
+        db_mongo.employees.insert_many([
+            {
+                "emp_code": f"EMP991{i}",
+                "name": f"Round {i}",
+                "email": f"r{i}@ex.com",
+                "department": dept,
+                "shift_start": "09:00",
+                "shift_end": "18:00",
+                "joined_on": "2026-07-01",
+                "created_at": datetime.now(timezone.utc),
+            }
+            for i in range(1, 8)
+        ])
+        # Day 1 (Monday 2026-07-06): 3 present out of 7 -> 3/7 = 0.428571... -> rounded 4-dec is 0.4286
+        # Day 2 (Tuesday 2026-07-07): 2 present out of 7 -> 2/7 = 0.285714... -> rounded 4-dec is 0.2857
+        # Mean of rounded rates = (0.4286 + 0.2857)/2 = 0.35715 -> rounded 4-dec half-up is 0.3572
+        # (Note: mean of unrounded fractions would be 5/14 = 0.357142... -> 0.3571)
+        db_mongo.attendance_logs.insert_many([
+            {"emp_code": "EMP9911", "date": "2026-07-06", "status": "PRESENT", "punch_in": 1, "punch_out": 2},
+            {"emp_code": "EMP9912", "date": "2026-07-06", "status": "PRESENT", "punch_in": 1, "punch_out": 2},
+            {"emp_code": "EMP9913", "date": "2026-07-06", "status": "PRESENT", "punch_in": 1, "punch_out": 2},
+            {"emp_code": "EMP9911", "date": "2026-07-07", "status": "PRESENT", "punch_in": 1, "punch_out": 2},
+            {"emp_code": "EMP9912", "date": "2026-07-07", "status": "PRESENT", "punch_in": 1, "punch_out": 2},
+        ])
+        client_mongo.close()
+
+        r = client.get(f"/analytics/departments/{dept}/trend", params={
+            "from": "2026-07-05",  # Sunday (non-working day)
+            "to": "2026-07-07",
+        })
+        assert r.status_code == 200
+        items = r.json()["items"]
+        assert len(items) == 3
+
+        # Sunday: non-working day -> null rate and null moving average
+        assert items[0]["date"] == "2026-07-05"
+        assert items[0]["is_working_day"] is False
+        assert items[0]["attendance_rate"] is None
+        assert items[0]["moving_avg_7d"] is None
+
+        # Monday: 3/7 -> 0.4286
+        assert items[1]["date"] == "2026-07-06"
+        assert items[1]["is_working_day"] is True
+        assert items[1]["headcount"] == 7
+        assert items[1]["present_count"] == 3
+        assert items[1]["attendance_rate"] == 0.4286
+        assert items[1]["moving_avg_7d"] == 0.4286
+
+        # Tuesday: 2/7 -> 0.2857; moving average = (0.4286 + 0.2857)/2 = 0.35715 -> 0.3572
+        assert items[2]["date"] == "2026-07-07"
+        assert items[2]["is_working_day"] is True
+        assert items[2]["headcount"] == 7
+        assert items[2]["present_count"] == 2
+        assert items[2]["attendance_rate"] == 0.2857
+        assert items[2]["moving_avg_7d"] == 0.3572
+
+    def test_monthly_analytics_mid_month_joiner_and_no_logs(self, client):
+        """Verify numerical accuracy for mid-month joiners and employees with 0 logs."""
+        # Employee with 0 logs
+        emp_nologs = "EMP9983"
+        client.post("/employees", json={
+            "emp_code": emp_nologs,
+            "name": "No Logs",
+            "email": "nologs@example.com",
+            "department": "Engineering",
+            "shift_start": "09:00",
+            "shift_end": "18:00",
+            "joined_on": "2026-07-01",
+        })
+        r_empty = client.get(f"/analytics/employees/{emp_nologs}/monthly", params={"month": "2026-07"})
+        assert r_empty.status_code == 200
+        data_empty = r_empty.json()
+        assert data_empty["emp_code"] == emp_nologs
+        assert data_empty["working_days"] == 23
+        assert data_empty["present_days"] == 0
+        assert data_empty["leave_days"] == 0
+        assert data_empty["late_count"] == 0
+        assert data_empty["total_late_minutes"] == 0
+        assert data_empty["total_overtime_minutes"] == 0
+        assert data_empty["attendance_pct"] == 0.0
+
+        # Mid-month joiner: joined 2026-07-15
+        emp_mid = "EMP9984"
+        client.post("/employees", json={
+            "emp_code": emp_mid,
+            "name": "Mid Joiner",
+            "email": "mid@example.com",
+            "department": "Engineering",
+            "shift_start": "09:00",
+            "shift_end": "18:00",
+            "joined_on": "2026-07-15",
+        })
+        # Add 1 full day log (2026-07-16) and 1 half-day log with late and overtime (2026-07-17)
+        from pymongo import MongoClient
+        client_mongo = MongoClient(os.getenv("MONGO_URI", "mongodb://localhost:27017"))
+        db_mongo = client_mongo[os.getenv("MONGO_DB", "attendance_test_db")]
+        db_mongo.attendance_logs.insert_many([
+            {
+                "emp_code": emp_mid,
+                "date": "2026-07-16",
+                "status": "PRESENT",
+                "half_day": False,
+                "late_minutes": 0,
+                "overtime_minutes": 0,
+            },
+            {
+                "emp_code": emp_mid,
+                "date": "2026-07-17",
+                "status": "PRESENT",
+                "half_day": True,
+                "late_minutes": 25,
+                "overtime_minutes": 45,
+            },
+        ])
+        client_mongo.close()
+
+        r_mid = client.get(f"/analytics/employees/{emp_mid}/monthly", params={"month": "2026-07"})
+        assert r_mid.status_code == 200
+        data_mid = r_mid.json()
+        assert data_mid["emp_code"] == emp_mid
+        assert data_mid["working_days"] == 13
+        assert data_mid["present_days"] == 1.5
+        assert data_mid["leave_days"] == 0
+        assert data_mid["late_count"] == 1
+        assert data_mid["total_late_minutes"] == 25
+        assert data_mid["total_overtime_minutes"] == 45
+        assert data_mid["attendance_pct"] == 11.54
+
+    def test_validation_error_responses_consistency(self, client):
+        """Verify both Pydantic schema validation and handler-level validation return 422 with a detail key."""
+        # 1. Pydantic schema validation error (missing required fields)
+        r_schema = client.post("/employees", json={"emp_code": "INV"})
+        assert r_schema.status_code == 422
+        assert "detail" in r_schema.json()
+
+        # 2. Handler-level validation error (logical date inversion)
+        r_handler = client.get("/analytics/departments/Engineering/trend", params={
+            "from": "2026-07-10",
+            "to": "2026-07-05",
+        })
+        assert r_handler.status_code == 422
+        assert "detail" in r_handler.json()
+        assert r_handler.json()["detail"] == "'to' must not be before 'from'"
 
 
 if __name__ == "__main__":

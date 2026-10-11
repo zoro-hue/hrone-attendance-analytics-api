@@ -44,29 +44,40 @@ ALL_STATUSES = {"PRESENT", "WFH", "ON_DUTY", "ABSENT", "LEAVE"}
 # ---------------------------------------------------------------------------
 client: MongoClient = None  # type: ignore
 db = None
+_indexes_created = False
 
 
 def get_db():
     return db
 
 
-def _create_indexes():
-    """Create all required indexes idempotently at startup."""
+def _create_indexes() -> bool:
+    """Create all required indexes idempotently."""
+    global _indexes_created
+    if _indexes_created:
+        return True
     _db = get_db()
-    # Unique index on emp_code — enforces concurrency-safe uniqueness
-    _db.employees.create_index([("emp_code", ASCENDING)], unique=True)
-    # For department filter + listing
-    _db.employees.create_index([("department", ASCENDING), ("emp_code", ASCENDING)])
+    if _db is None:
+        return False
+    try:
+        # Unique index on emp_code — enforces concurrency-safe uniqueness
+        _db.employees.create_index([("emp_code", ASCENDING)], unique=True)
+        # For department filter + listing
+        _db.employees.create_index([("department", ASCENDING), ("emp_code", ASCENDING)])
 
-    # Unique compound index — enforces one record per (emp_code, date)
-    _db.attendance_logs.create_index(
-        [("emp_code", ASCENDING), ("date", ASCENDING)], unique=True
-    )
-    # For list attendance sorted by date desc, emp_code asc + date range filters
-    # Note: this compound index also prefixes and covers all single-field date queries.
-    _db.attendance_logs.create_index(
-        [("date", DESCENDING), ("emp_code", ASCENDING)]
-    )
+        # Unique compound index — enforces one record per (emp_code, date)
+        _db.attendance_logs.create_index(
+            [("emp_code", ASCENDING), ("date", ASCENDING)], unique=True
+        )
+        # For list attendance sorted by date desc, emp_code asc + date range filters
+        # Note: this compound index also prefixes and covers all single-field date queries.
+        _db.attendance_logs.create_index(
+            [("date", DESCENDING), ("emp_code", ASCENDING)]
+        )
+        _indexes_created = True
+        return True
+    except Exception:
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -75,11 +86,17 @@ def _create_indexes():
 @asynccontextmanager
 async def lifespan(application: FastAPI):
     global client, db
-    client = MongoClient(os.getenv("MONGO_URI", "mongodb://localhost:27017"))
+    client = MongoClient(
+        os.getenv("MONGO_URI", "mongodb://localhost:27017"),
+        serverSelectionTimeoutMS=3000,
+    )
     db = client[os.getenv("MONGO_DB", "attendance_db")]
+    # Attempt startup index creation; if MongoDB is not yet available,
+    # the server still starts so /health can report 503 during runner polling.
     _create_indexes()
     yield
-    client.close()
+    if client:
+        client.close()
 
 
 app = FastAPI(
@@ -98,6 +115,8 @@ def round_half_up(value: Union[float, Decimal, int, str, None], decimals: int = 
         return None
     if isinstance(value, Decimal):
         d = value
+    elif hasattr(value, "to_decimal"):
+        d = value.to_decimal()
     else:
         d = Decimal(str(value))
     quant = Decimal(10) ** -decimals
@@ -480,10 +499,17 @@ def _validate_page_params(page: int, page_size: int):
 # ---------------------------------------------------------------------------
 @app.get("/health")
 def health():
-    """Readiness probe — returns 200 only if MongoDB answers a ping."""
+    """Readiness probe — returns 200 only if MongoDB answers a ping, otherwise 503."""
     try:
-        get_db().command("ping")
+        _db = get_db()
+        if _db is None:
+            raise HTTPException(503, detail="Database not initialized")
+        _db.command("ping")
+        if not _create_indexes():
+            raise HTTPException(503, detail="Index initialization pending")
         return {"status": "ok"}
+    except HTTPException:
+        raise
     except Exception:
         raise HTTPException(503, detail="MongoDB is not available")
 
@@ -1156,8 +1182,6 @@ def department_summary(
 ):
     _db = get_db()
     first_day_str, last_day_str = _validate_month(month)
-    first_day = date.fromisoformat(first_day_str)
-    last_day = date.fromisoformat(last_day_str)
 
     # Step 1: Get headcount per department (R9: employees joined on or before end of month)
     emp_filter: dict = {"joined_on": {"$lte": last_day_str}}
@@ -1433,7 +1457,26 @@ def _build_department_trend_pipeline(
                                 {"$gt": ["$headcount", 0]}
                             ]
                         },
-                        {"$divide": ["$present_count", "$headcount"]},
+                        {
+                            "$toDecimal": {
+                                "$divide": [
+                                    {
+                                        "$floor": {
+                                            "$add": [
+                                                {
+                                                    "$multiply": [
+                                                        {"$divide": ["$present_count", "$headcount"]},
+                                                        10000,
+                                                    ]
+                                                },
+                                                0.50000000001,
+                                            ]
+                                        }
+                                    },
+                                    10000,
+                                ]
+                            }
+                        },
                         None
                     ]
                 }
